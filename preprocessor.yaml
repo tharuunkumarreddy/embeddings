@@ -1,0 +1,516 @@
+name: Preprocessor - Bundle Builder
+description: >
+  Harmonise all 12 raw source Parquets into a single bundle.pkl and manifest.json.
+  Accepts optional paths for each source; missing sources are skipped gracefully.
+
+inputs:
+  - name: worldbank_path
+    type: String
+    description: 'Path to worldbank.parquet (empty = skip)'
+    default: ''
+  - name: imf_forecasts_path
+    type: String
+    description: 'Path to imf_forecasts.parquet (empty = skip)'
+    default: ''
+  - name: imf_timeseries_path
+    type: String
+    description: 'Path to imf_timeseries.parquet (empty = skip)'
+    default: ''
+  - name: gdelt_path
+    type: String
+    description: 'Path to gdelt.parquet (empty = skip)'
+    default: ''
+  - name: oecd_path
+    type: String
+    description: 'Path to oecd.parquet (empty = skip)'
+    default: ''
+  - name: wits_path
+    type: String
+    description: 'Path to wits.parquet (empty = skip)'
+    default: ''
+  - name: bis_path
+    type: String
+    description: 'Path to bis.parquet (empty = skip)'
+    default: ''
+  - name: ilostat_path
+    type: String
+    description: 'Path to ilostat.parquet (empty = skip)'
+    default: ''
+  - name: sec_path
+    type: String
+    description: 'Path to sec.parquet (empty = skip)'
+    default: ''
+  - name: comtrade_path
+    type: String
+    description: 'Path to comtrade.parquet (empty = skip)'
+    default: ''
+  - name: unido_path
+    type: String
+    description: 'Path to unido.parquet (empty = skip)'
+    default: ''
+  - name: unctad_path
+    type: String
+    description: 'Path to unctad.parquet (empty = skip)'
+    default: ''
+  - name: countries
+    type: String
+    description: 'Comma-separated ISO3 country codes. Empty = auto-detect.'
+    default: ''
+  - name: year_start
+    type: String
+    description: 'Start year (inclusive)'
+    default: '2010'
+  - name: year_end
+    type: String
+    description: 'End year (inclusive)'
+    default: '2025'
+
+outputs:
+  - name: bundle
+    type: Data
+    description: 'Preprocessed data bundle (bundle.pkl) for regime components'
+  - name: manifest
+    type: Data
+    description: 'Processing manifest JSON with source coverage and row counts'
+
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:v23
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import os
+        import json
+        import argparse
+        import logging
+        import pickle
+
+        import numpy as np
+        import pandas as pd
+
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+        log = logging.getLogger("preprocessor")
+
+        # ---------------------------------------------------------------------------
+        # Embedded constants
+        # ---------------------------------------------------------------------------
+        OECD_MEMBERS_ISO3 = {
+            "AUS", "AUT", "BEL", "CAN", "CHL", "COL", "CRI", "CZE", "DNK", "EST", "FIN", "FRA",
+            "DEU", "GRC", "HUN", "ISL", "IRL", "ISR", "ITA", "JPN", "KOR", "LVA", "LTU", "LUX",
+            "MEX", "NLD", "NZL", "NOR", "POL", "PRT", "SVK", "SVN", "ESP", "SWE", "CHE", "TUR", "GBR", "USA",
+        }
+        BIS_REPORTERS_ISO3 = {
+            "AUS", "AUT", "BEL", "BRA", "CAN", "CHL", "CHN", "DEU", "ESP", "FIN", "FRA", "GBR",
+            "GRC", "HKG", "IND", "IRL", "ITA", "JPN", "KOR", "LUX", "MYS", "MEX", "NLD", "PAN",
+            "PRT", "SGP", "SWE", "CHE", "TUR", "USA", "ZAF",
+        }
+        SEC_COVERAGE_ISO3 = {"USA"}
+        INFORMALITY_RATE_FALLBACK = 0.35
+
+        EXPECTED_SHAPES = {
+            "WGI":             (-1, 6),
+            "IMF_ArtIV":       (-1, 8),
+            "GDELT_govt":      (-1, 6),
+            "OECD_GOV":        (-1, 4),
+            "WITS_policy":     (-1, 4),
+            "WDI":             (-1, 7),
+            "WEO":             (-1, 6),
+            "BIS_credit":      (-1, 4),
+            "UNCTAD_PCI":      (-1, 3),
+            "UNIDO_MVA":       (-1, 4),
+            "WITS_NTM":        (-1, 3),
+            "SEC":             (-1, 4),
+            "IMF_FSAP":        (-1, 4),
+            "OECD_Digital":    (-1, 4),
+            "UNIDO_CIP":       (-1, 4),
+            "ILOSTAT":         (-1, 5),
+            "GDELT_density":   (-1, 3),
+            "SEC_rent":        (-1, 3),
+            "BIS_capital":     (-1, 3),
+            "ILOSTAT_wages":   (-1, 3),
+            "OECD_corpgov":    (-1, 3),
+            "IMF_GFSR":        (-1, 4),
+            "B_READY":         (-1, 5),
+            "UNCTAD_FDI":      (-1, 4),
+            "UNIDO_coord":     (-1, 3),
+            # time-series shapes set dynamically using T_STEPS
+        }
+
+        # ---------------------------------------------------------------------------
+        # Helper functions
+        # ---------------------------------------------------------------------------
+
+        def safe_float(df, col, default=0.0):
+            if col in df.columns:
+                return df[col].fillna(default).astype(float).values.astype(np.float32)
+            return np.full(len(df), default, dtype=np.float32)
+
+        def find_col(df, candidates, default=0.0):
+            for c in candidates:
+                if c in df.columns:
+                    return safe_float(df, c)
+            return np.full(len(df), default, dtype=np.float32)
+
+        def clip_arr(arr, lo, hi):
+            return np.clip(arr, lo, hi).astype(np.float32)
+
+        def apply_mask(arr, markets, mask_dict):
+            result = arr.copy()
+            for i, m in enumerate(markets):
+                if not mask_dict.get(m, True):
+                    result[i] = 0.0
+            return result
+
+        def project_to_market(df, markets, iso3_col, year_col=None):
+    Build (N, T) time-series array from long DataFrame.
+            iso_col = next((c for c in ["iso3", "country_code"] if c in df.columns), None)
+            year_col = next((c for c in ["year"] if c in df.columns), None)
+            aligned = project_to_market(df, markets, iso_col or "iso3", year_col)
+
+            # WGI
+            wgi = np.column_stack([
+                clip_arr(find_col(aligned, ["voice_accountability", "politicalStability", "va_est"]), -2.5, 2.5),
+                clip_arr(find_col(aligned, ["political_stability", "ps_est"]), -2.5, 2.5),
+                clip_arr(find_col(aligned, ["government_effectiveness", "ge_est"]), -2.5, 2.5),
+                clip_arr(find_col(aligned, ["regulatory_quality", "rq_est"]), -2.5, 2.5),
+                clip_arr(find_col(aligned, ["rule_of_law", "rl_est"]), -2.5, 2.5),
+                clip_arr(find_col(aligned, ["control_corruption", "cc_est"]), -2.5, 2.5),
+            ]).astype(np.float32)
+
+            # WDI
+            wdi = np.column_stack([
+                clip_arr(find_col(aligned, ["gdp_per_capita"]), 0, 150000),
+                clip_arr(find_col(aligned, ["inflation"]), -20, 100),
+                clip_arr(find_col(aligned, ["fdi_inflows_pct_gdp"]), -10, 50),
+                clip_arr(find_col(aligned, ["exports_pct_gdp"]), 0, 150),
+                clip_arr(find_col(aligned, ["gini_coefficient"]), 0, 100),
+                clip_arr(find_col(aligned, ["unemployment_rate"]), 0, 40),
+                clip_arr(find_col(aligned, ["internet_penetration"]), 0, 100),
+            ]).astype(np.float32)
+
+            # B_READY
+            b_ready = np.column_stack([
+                clip_arr(find_col(aligned, ["regulatory_framework_score", "b_ready_regulatory"]), 0, 100),
+                clip_arr(find_col(aligned, ["public_services_score"]), 0, 100),
+                clip_arr(find_col(aligned, ["operational_efficiency", "b_ready_operational"]), 0, 100),
+                clip_arr(find_col(aligned, ["pillar_business_entry", "b_ready_entry"]), 0, 100),
+                clip_arr(find_col(aligned, ["pillar_labor", "b_ready_labor"]), 0, 100),
+            ]).astype(np.float32)
+
+            return {"WGI": wgi, "WDI": wdi, "B_READY": b_ready}
+
+        def extract_imf(df_fc, df_ts, markets, T_STEPS):
+    -> {GDELT_govt(N,6), GDELT_density(N,3), GDELT_media_ts(N,T), GDELT_spikes_ts(N,T)}
+            iso_col = next(
+                (c for c in ["iso3", "reporter", "reporteriso3", "country_code"] if c in df.columns), None
+            )
+            aligned = project_to_market(df, markets, iso_col or "iso3")
+
+            wits_policy = np.column_stack([
+                find_col(aligned, ["tariff_applied_rate", "SimpleAverage"]),
+                find_col(aligned, ["trade_openness", "TradeOpenness"]),
+                find_col(aligned, ["tariff_dispersion", "StdDev"]),
+                find_col(aligned, ["trade_restrictiveness", "TTRI"]),
+            ]).astype(np.float32)
+
+            wits_ntm = np.column_stack([
+                find_col(aligned, ["ntm_count", "NTM_Count"]),
+                find_col(aligned, ["ntm_coverage_ratio", "NTM_Coverage"]),
+                find_col(aligned, ["ntm_frequency_index", "NTM_Freq"]),
+            ]).astype(np.float32)
+
+            return {"WITS_policy": wits_policy, "WITS_NTM": wits_ntm}
+
+        def extract_bis(df, markets, T_STEPS, bis_mask):
+    -> {ILOSTAT(N,5), ILOSTAT_wages(N,3)}
+            N = len(markets)
+            market_idx = {m: i for i, m in enumerate(markets)}
+
+            reporter_col = next(
+                (c for c in ["reporter_iso3", "reporteriso3", "reporter_code", "iso3", "country_code", "reporter"]
+                 if c in df.columns), None
+            )
+            partner_col = next(
+                (c for c in ["partner_iso3", "partneriso3", "partner_code", "partner"] if c in df.columns), None
+            )
+            val_col = next(
+                (c for c in ["trade_value", "tradevalue", "primaryvalue", "value_usd"] if c in df.columns), None
+            )
+
+            adj = np.zeros((N, N), dtype=np.float32)
+            if reporter_col and partner_col and val_col:
+                sub = df[df[reporter_col].isin(markets) & df[partner_col].isin(markets)].copy()
+                sub[val_col] = pd.to_numeric(sub[val_col], errors="coerce").fillna(0.0)
+                for _, row in sub.iterrows():
+                    ri = market_idx.get(row[reporter_col], -1)
+                    pi = market_idx.get(row[partner_col], -1)
+                    if ri >= 0 and pi >= 0:
+                        adj[ri, pi] += float(row[val_col])
+                max_val = adj.max()
+                if max_val > 0:
+                    adj = adj / max_val
+
+            iso_col = reporter_col or "iso3"
+            aligned = project_to_market(df, markets, iso_col)
+
+            node_feats = np.column_stack([
+                find_col(aligned, ["export_hhi"]),
+                find_col(aligned, ["import_hhi"]),
+                find_col(aligned, ["trade_balance_pct_gdp"]),
+                find_col(aligned, ["supply_chain_depth", "gvc_participation"]),
+            ]).astype(np.float32)
+
+            comtrade = {"adjacency": adj, "node_features": node_feats}
+
+            unctad_fdi = np.column_stack([
+                find_col(aligned, ["fdi_inflows_sector_norm", "fdi_inflows"]),
+                find_col(aligned, ["fdi_outflows"]),
+                find_col(aligned, ["fdi_stock_pct_gdp"]),
+                find_col(aligned, ["fdi_policy_index"]),
+            ]).astype(np.float32)
+
+            unctad_pci = np.column_stack([
+                find_col(aligned, ["productive_capacity_index", "pci", "PCI_SCORE"]),
+                find_col(aligned, ["economic_complexity", "eci"]),
+                find_col(aligned, ["structural_transformation", "diversification"]),
+            ]).astype(np.float32)
+
+            return {"Comtrade": comtrade, "UNCTAD_FDI": unctad_fdi, "UNCTAD_PCI": unctad_pci}
+
+        def extract_unctad(df, markets, T_STEPS):
+    -> {UNIDO_MVA(N,4), UNIDO_coord(N,3), UNIDO_CIP(N,4), UNIDO_IPI(N,T)}
+            iso_col = next(
+                (c for c in ["iso3", "country_code", "ccode", "country_iso", "reporter"] if c in df.columns), None
+            )
+            yr_col = next((c for c in ["year", "period", "time"] if c in df.columns), None)
+            aligned = project_to_market(df, markets, iso_col or "iso3", yr_col)
+
+            unido_mva = np.column_stack([
+                find_col(aligned, ["mva_pct_gdp", "mva_share"]),
+                find_col(aligned, ["mva_per_capita", "mva_pc"]),
+                find_col(aligned, ["manufacturing_employment", "manuf_emp"]),
+                find_col(aligned, ["mva_growth", "mva_growth_rate"]),
+            ]).astype(np.float32)
+
+            unido_coord = np.column_stack([
+                find_col(aligned, ["industrial_cluster_density", "cluster_density"]),
+                find_col(aligned, ["supply_chain_integration", "supply_chain_idx"]),
+                find_col(aligned, ["firm_density_norm", "firm_density"]),
+            ]).astype(np.float32)
+
+            unido_cip = np.column_stack([
+                find_col(aligned, ["cip_score", "CIP_SCORE"]),
+                find_col(aligned, ["export_quality_index", "export_quality"]),
+                find_col(aligned, ["tech_intensity_mfg", "hi_tech_pct"]),
+                find_col(aligned, ["industry_share_exports", "ind_export_pct"]),
+            ]).astype(np.float32)
+
+            unido_ipi = build_ts(df, "ipi_index", yr_col, markets, iso_col or "iso3", T_STEPS)
+
+            return {
+                "UNIDO_MVA": unido_mva,
+                "UNIDO_coord": unido_coord,
+                "UNIDO_CIP": unido_cip,
+                "UNIDO_IPI": unido_ipi,
+            }
+
+        # ---------------------------------------------------------------------------
+        # fill_missing
+        # ---------------------------------------------------------------------------
+
+        def fill_missing(data_dict, markets, T_STEPS):
+            N = len(markets)
+            ts_keys = ["UNIDO_IPI", "GDELT_media_ts", "GDELT_spikes_ts", "SEC_8K_ts", "BIS_credit_ts"]
+            for key, shape in EXPECTED_SHAPES.items():
+                if key not in data_dict:
+                    dims = tuple(N if d == -1 else d for d in shape)
+                    data_dict[key] = np.zeros(dims, dtype=np.float32)
+            for key in ts_keys:
+                if key not in data_dict:
+                    data_dict[key] = np.zeros((N, T_STEPS), dtype=np.float32)
+            if "Comtrade" not in data_dict:
+                data_dict["Comtrade"] = {
+                    "adjacency": np.zeros((N, N), dtype=np.float32),
+                    "node_features": np.zeros((N, 4), dtype=np.float32),
+                }
+            return data_dict
+
+        # ---------------------------------------------------------------------------
+        # main
+        # ---------------------------------------------------------------------------
+
+        def main():
+            ap = argparse.ArgumentParser(description="Component: Preprocessor")
+            ap.add_argument("--worldbank_path",      default="", help="worldbank.parquet")
+            ap.add_argument("--imf_forecasts_path",  default="", help="imf_forecasts.parquet")
+            ap.add_argument("--imf_timeseries_path", default="", help="imf_timeseries.parquet")
+            ap.add_argument("--gdelt_path",          default="", help="gdelt.parquet")
+            ap.add_argument("--oecd_path",           default="", help="oecd.parquet")
+            ap.add_argument("--wits_path",           default="", help="wits.parquet")
+            ap.add_argument("--bis_path",            default="", help="bis.parquet")
+            ap.add_argument("--ilostat_path",        default="", help="ilostat.parquet")
+            ap.add_argument("--sec_path",            default="", help="sec.parquet")
+            ap.add_argument("--comtrade_path",       default="", help="comtrade.parquet")
+            ap.add_argument("--unido_path",          default="", help="unido.parquet")
+            ap.add_argument("--unctad_path",         default="", help="unctad.parquet (UNCTAD_output.csv parquet)")
+            ap.add_argument("--countries",           default="",
+                            help="Optional comma-sep ISO3 codes. Auto-detected from parquets if empty.")
+            ap.add_argument("--year_start",          type=int, default=2010)
+            ap.add_argument("--year_end",            type=int, default=2025)
+            ap.add_argument("--output_bundle",       required=True, help="Output bundle.pkl path")
+            ap.add_argument("--output_manifest",     required=True, help="Output manifest.json path")
+            args = ap.parse_args()
+
+            paths = {
+                "worldbank":      args.worldbank_path,
+                "imf_forecasts":  args.imf_forecasts_path,
+                "imf_timeseries": args.imf_timeseries_path,
+                "gdelt":          args.gdelt_path,
+                "oecd":           args.oecd_path,
+                "wits":           args.wits_path,
+                "bis":            args.bis_path,
+                "ilostat":        args.ilostat_path,
+                "sec":            args.sec_path,
+                "comtrade":       args.comtrade_path,
+                "unido":          args.unido_path,
+                "unctad":         args.unctad_path,
+            }
+
+            if args.countries:
+                markets = [c.strip() for c in args.countries.split(",")]
+            else:
+                markets = detect_countries_from_parquets(paths)
+                log.info(f"Auto-detected {len(markets)} countries from parquets")
+
+            T_STEPS = args.year_end - args.year_start + 1
+            N = len(markets)
+
+            oecd_mask = {iso: (iso in OECD_MEMBERS_ISO3) for iso in markets}
+            bis_mask  = {iso: (iso in BIS_REPORTERS_ISO3) for iso in markets}
+            sec_mask  = {iso: (iso in SEC_COVERAGE_ISO3)  for iso in markets}
+
+            log.info("=" * 60)
+            log.info(f"  Preprocessor  |  markets={len(markets)}  T_STEPS={T_STEPS}")
+            log.info("=" * 60)
+
+            data_dict = {}
+            data_dict["__countries__"] = markets
+            data_dict["__year_start__"] = args.year_start
+            data_dict["__year_end__"] = args.year_end
+
+            def load(key):
+                p = paths.get(key, "")
+                if not p or not os.path.exists(p):
+                    log.warning(f"  Source missing: {key} ({p!r})")
+                    return None
+                df = pd.read_parquet(p)
+                log.info(f"  Loaded {key}  {df.shape}")
+                return df
+
+            if (df := load("worldbank")) is not None:
+                data_dict.update(extract_worldbank(df, markets, T_STEPS))
+
+            df_fc = load("imf_forecasts")
+            df_ts = load("imf_timeseries")
+            if df_fc is not None or df_ts is not None:
+                data_dict.update(extract_imf(
+                    df_fc if df_fc is not None else pd.DataFrame(),
+                    df_ts if df_ts is not None else pd.DataFrame(),
+                    markets, T_STEPS,
+                ))
+
+            if (df := load("gdelt")) is not None:
+                data_dict.update(extract_gdelt(df, markets, T_STEPS))
+
+            if (df := load("oecd")) is not None:
+                data_dict.update(extract_oecd(df, markets, T_STEPS, oecd_mask))
+
+            if (df := load("wits")) is not None:
+                data_dict.update(extract_wits(df, markets, T_STEPS))
+
+            if (df := load("bis")) is not None:
+                data_dict.update(extract_bis(df, markets, T_STEPS, bis_mask))
+
+            if (df := load("ilostat")) is not None:
+                data_dict.update(extract_ilostat(df, markets, T_STEPS))
+
+            if (df := load("sec")) is not None:
+                data_dict.update(extract_sec(df, markets, T_STEPS, sec_mask))
+
+            if (df := load("comtrade")) is not None:
+                data_dict.update(extract_comtrade(df, markets, T_STEPS))
+
+            if (df := load("unido")) is not None:
+                data_dict.update(extract_unido(df, markets, T_STEPS))
+
+            # UNCTAD -- overwrites UNCTAD_FDI/UNCTAD_PCI if separate file present
+            if (df := load("unctad")) is not None:
+                data_dict.update(extract_unctad(df, markets, T_STEPS))
+
+            data_dict = fill_missing(data_dict, markets, T_STEPS)
+
+            # Save bundle
+            os.makedirs(os.path.dirname(args.output_bundle) or ".", exist_ok=True)
+            with open(args.output_bundle, "wb") as f:
+                pickle.dump(data_dict, f)
+            log.info(f"Bundle saved -> {args.output_bundle}  ({len(data_dict)} keys)")
+
+            # Save manifest
+            def _describe(v):
+                if hasattr(v, "shape"):
+                    return list(v.shape)
+                elif isinstance(v, dict):
+                    return {
+                        kk: list(vv.shape) if hasattr(vv, "shape") else len(vv) if isinstance(vv, list) else str(type(vv))
+                        for kk, vv in v.items()
+                    }
+                elif isinstance(v, list):
+                    return len(v)
+                return str(type(v))
+
+            manifest = {k: _describe(v) for k, v in data_dict.items()}
+            os.makedirs(os.path.dirname(args.output_manifest) or ".", exist_ok=True)
+            with open(args.output_manifest, "w") as f:
+                json.dump(manifest, f, indent=2)
+            log.info(f"Manifest saved -> {args.output_manifest}")
+            log.info("=" * 60)
+
+        if __name__ == "__main__":
+            main()
+    args:
+      - --worldbank_path
+      - {inputValue: worldbank_path}
+      - --imf_forecasts_path
+      - {inputValue: imf_forecasts_path}
+      - --imf_timeseries_path
+      - {inputValue: imf_timeseries_path}
+      - --gdelt_path
+      - {inputValue: gdelt_path}
+      - --oecd_path
+      - {inputValue: oecd_path}
+      - --wits_path
+      - {inputValue: wits_path}
+      - --bis_path
+      - {inputValue: bis_path}
+      - --ilostat_path
+      - {inputValue: ilostat_path}
+      - --sec_path
+      - {inputValue: sec_path}
+      - --comtrade_path
+      - {inputValue: comtrade_path}
+      - --unido_path
+      - {inputValue: unido_path}
+      - --unctad_path
+      - {inputValue: unctad_path}
+      - --countries
+      - {inputValue: countries}
+      - --year_start
+      - {inputValue: year_start}
+      - --year_end
+      - {inputValue: year_end}
+      - --output_bundle
+      - {outputPath: bundle}
+      - --output_manifest
+      - {outputPath: manifest}

@@ -1,0 +1,157 @@
+name: C_m Loader - Country-Market Crosswalk
+description: >
+  Load ISIC sector crosswalk CSV to produce c_m_bundle.parquet containing
+  sector weights, gates, and ISIC codes per country/year for regime gating.
+
+inputs:
+  - name: isic_csv
+    type: String
+    description: 'Path to playbook_a_isic_full_v2.csv (ISIC crosswalk)'
+  - name: countries
+    type: String
+    description: 'Comma-separated ISO3 country codes. Empty = all.'
+    default: ''
+  - name: year_start
+    type: String
+    description: 'Start year (inclusive)'
+  - name: year_end
+    type: String
+    description: 'End year (inclusive)'
+  - name: isic_level
+    type: String
+    description: 'ISIC aggregation level filter (empty = all levels)'
+    default: ''
+
+outputs:
+  - name: c_m_bundle
+    type: Data
+    description: 'Country-market crosswalk Parquet (country | year | isic_code | isic_level | sector_weight | c_m_gate)'
+
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:v23
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import os
+        import argparse
+        import logging
+
+        import pandas as pd
+
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+        log = logging.getLogger("cm_loader")
+
+        # C_m column names as in the ISIC CSV
+        CM_COLS = [
+            "c_m_observability", "c_m_incentive_to_report", "c_m_temporal_lag",
+            "c_m_program_bias", "c_m_revision_lag", "c_m_informality_observ",
+            "c_m_selection_bias", "c_m_methodology_drift", "c_m_greenwashing",
+            "c_m_path_dependence", "c_m_semantic_drift", "c_m_hs_drift",
+            "cm_anchor_product",
+        ]
+        META_COLS = [
+            "country", "year", "isic_level", "isic_code", "isic_name",
+            "isic_section", "isic_division", "isic_group", "isic_class",
+            "aggregate_activity", "dominant_isic_section", "dominant_sector_share_pct",
+        ]
+
+        def load_c_m(
+            isic_csv: str,
+            countries: list,
+            year_start: int,
+            year_end: int,
+            isic_level: str = "",
+        ) -> pd.DataFrame:
+            log.info(f"Reading ISIC CSV: {isic_csv}")
+            df = pd.read_csv(isic_csv, low_memory=False)
+            log.info(f"Total rows: {len(df):,}")
+
+            # Year filter
+            if "year" in df.columns:
+                df = df[(df["year"] >= year_start) & (df["year"] <= year_end)]
+            log.info(f"After year filter ({year_start}-{year_end}): {len(df):,}")
+
+            # Country filter -- skip if countries list is empty (load all)
+            country_col = next((c for c in ["country", "iso3", "iso_code"] if c in df.columns), None)
+            if country_col and countries:
+                df = df[df[country_col].isin(countries)]
+                log.info(f"After country filter ({len(countries)} countries): {len(df):,}")
+            else:
+                log.info(f"No country filter applied -- keeping all countries: {len(df):,}")
+
+            # ISIC level filter -- skip if isic_level is empty
+            if isic_level and "isic_level" in df.columns:
+                df = df[df["isic_level"] == isic_level]
+                log.info(f"After isic_level filter ('{isic_level}'): {len(df):,}")
+
+            # Keep only useful columns
+            meta_present = [c for c in META_COLS if c in df.columns]
+            cm_present   = [c for c in CM_COLS   if c in df.columns]
+            df = df[meta_present + cm_present].copy()
+
+            # Compute aggregate C_m gate (mean of all c_m_* columns)
+            if cm_present:
+                df["c_m_gate"] = df[cm_present].mean(axis=1).clip(0, 1)
+            else:
+                df["c_m_gate"] = 0.5
+
+            # sector_weight from dominant_sector_share_pct
+            if "dominant_sector_share_pct" in df.columns:
+                df["sector_weight"] = (df["dominant_sector_share_pct"] / 100.0).clip(0, 1)
+            else:
+                df["sector_weight"] = 1.0
+
+            return df.reset_index(drop=True)
+
+        def main():
+            ap = argparse.ArgumentParser(description="Component: C_m constraint loader")
+            ap.add_argument("--isic_csv",    required=True,  help="Path to playbook_a_isic_full_v2.csv")
+            ap.add_argument("--countries",   default="",
+                            help="Optional comma-sep ISO3 codes. If empty, all countries are loaded.")
+            ap.add_argument("--year_start",  type=int, required=True)
+            ap.add_argument("--year_end",    type=int, required=True)
+            ap.add_argument("--output_path", required=True, help="Output c_m_bundle.parquet path")
+            ap.add_argument("--isic_level",  default="",
+                            help="Optional ISIC level filter: Section, Division, Group, Class")
+            args = ap.parse_args()
+
+            countries = [c.strip() for c in args.countries.split(",")] if args.countries.strip() else []
+
+            log.info("=" * 60)
+            log.info("  C_m Constraint Loader")
+            log.info("=" * 60)
+
+            df = load_c_m(
+                args.isic_csv,
+                countries,
+                args.year_start,
+                args.year_end,
+                isic_level=args.isic_level,
+            )
+
+            os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
+            df.to_parquet(args.output_path, index=False, engine="pyarrow", compression="snappy")
+
+            log.info(f"Saved C_m bundle -> {args.output_path}  shape={df.shape}")
+            log.info(f"  Countries : {df['country'].nunique() if 'country' in df.columns else 'N/A'}")
+            log.info(f"  C_m gate mean: {df['c_m_gate'].mean():.4f}  min: {df['c_m_gate'].min():.4f}")
+            log.info("=" * 60)
+
+        if __name__ == "__main__":
+            main()
+    args:
+      - --isic_csv
+      - {inputValue: isic_csv}
+      - --countries
+      - {inputValue: countries}
+      - --year_start
+      - {inputValue: year_start}
+      - --year_end
+      - {inputValue: year_end}
+      - --isic_level
+      - {inputValue: isic_level}
+      - --output_path
+      - {outputPath: c_m_bundle}

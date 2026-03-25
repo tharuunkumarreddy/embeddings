@@ -1,0 +1,279 @@
+name: Regime R9 - Temporal & Shock
+description: >
+  BOCPD change-point features + linear SSM (Kalman). embed_dim=32. REGIME_DIMS: [256, 288].
+
+inputs:
+  - name: regime_id
+    type: String
+    description: 'Regime identifier (r1..r9) used in metadata output'
+    default: 'r9'
+  - name: bundle
+    type: String
+    description: 'Path to bundle.pkl from Preprocessor component'
+  - name: c_m_path
+    type: String
+    description: 'Path to c_m_bundle.parquet from C_m Loader (empty = no gating)'
+    default: ''
+  - name: countries
+    type: String
+    description: 'Comma-separated ISO3 country codes. Empty = auto-detect from bundle.'
+    default: ''
+  - name: year_start
+    type: String
+    description: 'Start year (inclusive)'
+    default: '2010'
+  - name: year_end
+    type: String
+    description: 'End year (inclusive)'
+    default: '2025'
+
+outputs:
+  - name: embeddings
+    type: Data
+    description: 'Regime embeddings Parquet (country | year | isic_code | isic_level | dim_0..dim_31)'
+  - name: meta
+    type: Data
+    description: 'Regime metadata JSON'
+
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:v23
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import os, json, argparse, logging, pickle, time, abc
+        import numpy as np
+        import pandas as pd
+        import torch
+        import torch.nn as nn
+
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+        log = logging.getLogger("regime_r9")
+
+        # -- Inline BaseRegimeModel ----------------------------------------------------
+
+        class BaseRegimeModel(abc.ABC):
+            @property
+            @abc.abstractmethod
+            def regime_name(self) -> str: ...
+            @property
+            @abc.abstractmethod
+            def embed_dim(self) -> int: ...
+            @abc.abstractmethod
+            def fit(self, data_dict: dict) -> None: ...
+            @abc.abstractmethod
+            def embed(self, data_dict: dict) -> torch.Tensor: ...
+
+            @staticmethod
+            def to_tensor(arr):
+                return torch.from_numpy(np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)).float()
+
+            @staticmethod
+            def guard_output(t, name):
+                if torch.isnan(t).any() or torch.isinf(t).any():
+                    log.warning(f"{name}: NaN/Inf in output - replacing with 0")
+                    t = torch.nan_to_num(t, nan=0.0, posinf=1.0, neginf=0.0)
+                return t
+
+        # -- R9 Model: BOCPD + SSM (inlined - no import from r2) ----------------------
+
+        EMBED_DIM  = 32
+        HIDDEN_DIM = 48
+        N_EPOCHS   = 150
+        LR         = 1e-3
+
+        SSM_LATENT     = 8
+        OBS_DIM        = 2   # GDELT (1) + BIS (1)
+        SHOCK_FEAT_DIM = 3 + 3 + 4   # GDELT BOCPD(3) + BIS BOCPD(3) + GFSR(4) = 10
+
+        def bocpd_change_flag(series: np.ndarray, hazard: float = 0.1) -> np.ndarray:
+    BOCPD on GDELT + BIS time series + IMF_GFSR -> (N, 10).
+
+            def __init__(self, ssm_dim, feat_dim, embed_dim, hidden):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Linear(ssm_dim + feat_dim, hidden),
+                    nn.LayerNorm(hidden), nn.GELU(),
+                    nn.Linear(hidden, embed_dim),
+                )
+
+            def forward(self, z_ssm, cp_feats):
+                return self.net(torch.cat([z_ssm, cp_feats], dim=-1))
+
+        class TemporalShockRegime(BaseRegimeModel):
+            
+
+            @property
+            def regime_name(self): return "Temporal & Shock"
+            @property
+            def embed_dim(self): return EMBED_DIM
+
+            def __init__(self):
+                self.ssm  = None
+                self.head = None
+
+            def _get_ts(self, data_dict):
+                g = torch.from_numpy(
+                    np.nan_to_num(data_dict["GDELT_spikes_ts"], nan=0.0).astype(np.float32)
+                ).unsqueeze(-1)
+                b = torch.from_numpy(
+                    np.nan_to_num(data_dict["BIS_credit_ts"], nan=0.0).astype(np.float32)
+                ).unsqueeze(-1)
+                return torch.cat([g, b], dim=-1)   # (N, T, 2)
+
+            def fit(self, data_dict):
+                ts_x = self._get_ts(data_dict)
+                cp   = torch.from_numpy(extract_shock_features(data_dict))
+                ts_mean = ts_x.mean(dim=1)
+
+                self.ssm  = LinearSSM(OBS_DIM, SSM_LATENT)
+                self.head = ShockHead(SSM_LATENT, SHOCK_FEAT_DIM, EMBED_DIM, HIDDEN_DIM)
+                params = list(self.ssm.parameters()) + list(self.head.parameters())
+                opt = torch.optim.Adam(params, lr=LR)
+
+                for _ in range(N_EPOCHS):
+                    opt.zero_grad()
+                    z_ssm, x_hat = self.ssm(ts_x)
+                    emb = self.head(z_ssm, cp)
+                    recon_loss = nn.functional.mse_loss(x_hat, ts_mean)
+                    cov_off    = (emb.T @ emb / emb.shape[0]) * (1 - torch.eye(EMBED_DIM))
+                    div        = cov_off.pow(2).mean() * 1e-3
+                    (recon_loss + div).backward()
+                    nn.utils.clip_grad_norm_(params, 1.0)
+                    opt.step()
+
+                self.ssm.eval()
+                self.head.eval()
+
+            def embed(self, data_dict):
+                if self.ssm is None:
+                    self.fit(data_dict)
+                ts_x = self._get_ts(data_dict)
+                cp   = torch.from_numpy(extract_shock_features(data_dict))
+                with torch.no_grad():
+                    z_ssm, _ = self.ssm(ts_x)
+                    emb = self.head(z_ssm, cp)
+                return self.guard_output(emb, self.regime_name)
+
+        # -- Runner utilities (inlined) ------------------------------------------------
+
+        def get_country_ids_from_bundle(data_dict):
+            if "__countries__" in data_dict:
+                return data_dict["__countries__"]
+            for val in data_dict.values():
+                if isinstance(val, np.ndarray) and val.ndim >= 1:
+                    return [f"country_{i}" for i in range(val.shape[0])]
+            return []
+
+        def apply_cm_gating(emb_np, c_m_df):
+            if c_m_df.empty:
+                return pd.DataFrame()
+            base    = emb_np[0]
+            gates   = c_m_df["c_m_gate"].values.astype(np.float32)      if "c_m_gate"      in c_m_df.columns else np.full(len(c_m_df), 0.5, dtype=np.float32)
+            weights = c_m_df["sector_weight"].values.astype(np.float32) if "sector_weight" in c_m_df.columns else np.ones(len(c_m_df),       dtype=np.float32)
+            gated  = base[None, :] * (gates * weights)[:, None]
+            result = pd.DataFrame(gated, columns=[f"dim_{i}" for i in range(len(base))])
+            result.insert(0, "isic_code",  c_m_df["isic_code"].values  if "isic_code"  in c_m_df.columns else "")
+            result.insert(1, "isic_level", c_m_df["isic_level"].values if "isic_level" in c_m_df.columns else "")
+            return result
+
+        def run_for_bundle(data_dict, model, c_m_df, countries, years):
+            all_rows = []
+            N = len(countries)
+            log.info(f"  Fitting model: {model.regime_name}")
+            model.fit(data_dict)
+            base_np = model.embed(data_dict).detach().numpy()
+            log.info(f"  Base embedding: {base_np.shape}")
+            for ci, country in enumerate(countries):
+                emb_c = base_np[[ci]]
+                c_m_c = c_m_df[c_m_df["country"] == country] if "country" in c_m_df.columns else c_m_df
+                for year in years:
+                    c_m_yr = (c_m_c[c_m_c["year"] == year]
+                              if "year" in c_m_df.columns and not c_m_c.empty else c_m_c)
+                    if c_m_yr.empty:
+                        all_rows.append({"country": country, "year": year,
+                                         "isic_code": "ALL", "isic_level": "ALL",
+                                         **{f"dim_{i}": float(emb_c[0, i])
+                                            for i in range(emb_c.shape[1])}})
+                        continue
+                    gdf = apply_cm_gating(emb_c, c_m_yr)
+                    if gdf.empty:
+                        continue
+                    gdf.insert(0, "year", year)
+                    gdf.insert(0, "country", country)
+                    all_rows.extend(gdf.to_dict("records"))
+                if (ci + 1) % 20 == 0:
+                    log.info(f"  {ci+1}/{N} countries ...")
+            return pd.DataFrame(all_rows)
+
+        # -- Main ---------------------------------------------------------------------
+
+        def main():
+            ap = argparse.ArgumentParser(description="Component: Regime Runner")
+            ap.add_argument("--regime_id",  default="r9", help="Regime identifier")
+            ap.add_argument("--bundle",     required=True)
+            ap.add_argument("--c_m_path",   default="")
+            ap.add_argument("--output",     required=True)
+            ap.add_argument("--meta_path",  default="")
+            ap.add_argument("--countries",  default="")
+            ap.add_argument("--year_start", type=int, default=2010)
+            ap.add_argument("--year_end",   type=int, default=2025)
+            args = ap.parse_args()
+
+            log.info("=" * 60)
+            log.info(f"  Regime Runner  |  regime={args.regime_id}  (Temporal & Shock)")
+            log.info("=" * 60)
+
+            with open(args.bundle, "rb") as f:
+                data_dict = pickle.load(f)
+
+            countries = ([c.strip() for c in args.countries.split(",")]
+                         if args.countries else get_country_ids_from_bundle(data_dict))
+            years = list(range(args.year_start, args.year_end + 1))
+
+            c_m_df = pd.DataFrame()
+            if args.c_m_path and os.path.exists(args.c_m_path):
+                c_m_df = pd.read_parquet(args.c_m_path)
+                log.info(f"C_m loaded: {c_m_df.shape}")
+
+            model = TemporalShockRegime()
+            log.info(f"Running {model.regime_name}  embed_dim={model.embed_dim}  "
+                     f"N={len(countries)}  T={len(years)}")
+
+            t0 = time.time()
+            result_df = run_for_bundle(data_dict, model, c_m_df, countries, years)
+            elapsed = time.time() - t0
+
+            os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+            result_df.to_parquet(args.output, index=False, engine="pyarrow", compression="snappy")
+            log.info(f"Saved -> {args.output}  shape={result_df.shape}  ({elapsed:.1f}s)")
+
+            if args.meta_path:
+                os.makedirs(os.path.dirname(args.meta_path) or ".", exist_ok=True)
+                with open(args.meta_path, "w") as f:
+                    json.dump({"regime_id": args.regime_id, "regime_name": model.regime_name,
+                               "embed_dim": model.embed_dim, "regime_dims": [256, 288],
+                               "output_shape": list(result_df.shape),
+                               "runtime_s": round(elapsed, 2)}, f, indent=2)
+
+        if __name__ == "__main__":
+            main()
+    args:
+      - --regime_id
+      - {inputValue: regime_id}
+      - --bundle
+      - {inputValue: bundle}
+      - --c_m_path
+      - {inputValue: c_m_path}
+      - --countries
+      - {inputValue: countries}
+      - --year_start
+      - {inputValue: year_start}
+      - --year_end
+      - {inputValue: year_end}
+      - --output
+      - {outputPath: embeddings}
+      - --meta_path
+      - {outputPath: meta}

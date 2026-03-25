@@ -1,0 +1,270 @@
+name: Tensor Assembler - R_m (288d)
+description: >
+  Concatenate individual regime embeddings r1..r9 into the combined 288-dim R_m tensor.
+  Each regime contributes 32 dims (9x32=288). Also records paths to P_m, D_m, A_m
+  in tensor_meta.json for downstream readout. Outputs R_m.parquet + tensor_meta.json.
+
+inputs:
+  - name: r1_path
+    type: String
+    description: 'Path to r1.parquet (Political Power [0,32])'
+    default: ''
+  - name: r2_path
+    type: String
+    description: 'Path to r2.parquet (Measurement & Statistical [32,64])'
+    default: ''
+  - name: r3_path
+    type: String
+    description: 'Path to r3.parquet (Economic Coordination [64,96])'
+    default: ''
+  - name: r4_path
+    type: String
+    description: 'Path to r4.parquet (Regulatory & Enforcement [96,128])'
+    default: ''
+  - name: r5_path
+    type: String
+    description: 'Path to r5.parquet (Technological Production [128,160])'
+    default: ''
+  - name: r6_path
+    type: String
+    description: 'Path to r6.parquet (Operational Reality [160,192])'
+    default: ''
+  - name: r7_path
+    type: String
+    description: 'Path to r7.parquet (Narrative & Legitimacy [192,224])'
+    default: ''
+  - name: r8_path
+    type: String
+    description: 'Path to r8.parquet (Incentive & Rent [224,256])'
+    default: ''
+  - name: r9_path
+    type: String
+    description: 'Path to r9.parquet (Temporal & Shock [256,288])'
+    default: ''
+  - name: p_m_path
+    type: String
+    description: 'Path to p_m.parquet (Phase Mapper output)'
+    default: ''
+  - name: d_m_path
+    type: String
+    description: 'Path to d_m.parquet (Dynamics Mapper output)'
+    default: ''
+  - name: a_m_path
+    type: String
+    description: 'Path to a_m.parquet (Agency Mapper output)'
+    default: ''
+
+outputs:
+  - name: R_m
+    type: Data
+    description: 'Output directory containing R_m.parquet and tensor_meta.json'
+
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:v23
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import os, json, argparse, logging, time
+        import numpy as np
+        import pandas as pd
+
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+        log = logging.getLogger("tensor_assembler")
+
+        EMBED_DIM = 32
+
+        REGIME_META = [
+            ("r1", "Political Power",           [0,   32]),
+            ("r2", "Measurement & Statistical", [32,  64]),
+            ("r3", "Economic Coordination",     [64,  96]),
+            ("r4", "Regulatory & Enforcement",  [96,  128]),
+            ("r5", "Technological Production",  [128, 160]),
+            ("r6", "Operational Reality",       [160, 192]),
+            ("r7", "Narrative & Legitimacy",    [192, 224]),
+            ("r8", "Incentive & Rent",          [224, 256]),
+            ("r9", "Temporal & Shock",          [256, 288]),
+        ]
+
+        JOIN_KEYS = ["country", "year", "isic_code", "isic_level"]
+
+        # -- Loaders -------------------------------------------------------------------
+
+        def load_regime(path, regime_id):
+    Use the first available regime to derive the (country,year,isic,level) index.
+            n_rows   = len(assembled)
+            n_dims   = len(REGIME_META) * EMBED_DIM   # 288
+            dim_arr  = np.zeros((n_rows, n_dims), dtype=np.float32)
+            mask_arr = {}
+
+            global_i = 0
+            for rid, _, _ in REGIME_META:
+                r_cols  = [f"{rid}_{j}" for j in range(EMBED_DIM)]
+                present = [c for c in r_cols if c in assembled.columns]
+
+                if present:
+                    block = assembled[r_cols].values.astype(np.float32)  # fills missing with 0 already
+                    dim_arr[:, global_i: global_i + EMBED_DIM] = block
+                    mask_arr[f"mask_{rid}"] = (np.abs(block).sum(axis=1) > 1e-9).astype(np.int8)
+                else:
+                    mask_arr[f"mask_{rid}"] = np.zeros(n_rows, dtype=np.int8)
+
+                global_i += EMBED_DIM
+
+            # Build final DataFrame in one shot (no fragmentation)
+            dim_cols  = {f"dim_{i}": dim_arr[:, i] for i in range(n_dims)}
+            flat = pd.concat(
+                [assembled[key_cols].reset_index(drop=True),
+                 pd.DataFrame(dim_cols),
+                 pd.DataFrame(mask_arr)],
+                axis=1,
+            )
+            return flat
+
+        # -- Main ----------------------------------------------------------------------
+
+        def main():
+            ap = argparse.ArgumentParser(description="Component: Tensor Assembler - R_m (288d)")
+            for rid, _, _ in REGIME_META:
+                ap.add_argument(f"--{rid}_path", default="", help=f"Path to {rid}.parquet")
+            ap.add_argument("--p_m_path",   default="", help="Path to p_m.parquet")
+            ap.add_argument("--d_m_path",   default="", help="Path to d_m.parquet")
+            ap.add_argument("--a_m_path",   default="", help="Path to a_m.parquet")
+            ap.add_argument("--output_dir", required=True, help="Output directory")
+            args = ap.parse_args()
+
+            os.makedirs(args.output_dir, exist_ok=True)
+
+            log.info("=" * 60)
+            log.info("  Tensor Assembler  |  R_m = r1 || r2 || ... || r9  (288d)")
+            log.info("=" * 60)
+            t0 = time.time()
+
+            # -- 1. Load individual regime parquets ------------------------------------
+            log.info("Loading regime parquets...")
+            regime_dfs = []
+            observed_flags = {}
+            for rid, name, _ in REGIME_META:
+                path = getattr(args, f"{rid}_path", "")
+                df, observed = load_regime(path, rid)
+                regime_dfs.append((rid, df))
+                observed_flags[rid] = observed
+
+            # -- 2. Build join index ---------------------------------------------------
+            base, key_cols = build_base_index(regime_dfs)
+            if base is None:
+                log.error("No regime parquets found - cannot assemble R_m")
+                raise SystemExit(1)
+
+            # -- 3. Join all regimes ---------------------------------------------------
+            log.info("Joining regimes on (country, year, isic_code, isic_level)...")
+            assembled = join_regimes(base, key_cols, regime_dfs)
+            log.info(f"  Assembled: {assembled.shape}")
+
+            # -- 4. Flatten -> dim_0..dim_287 + mask cols -------------------------------
+            log.info("Flattening to R_m (dim_0..dim_287)...")
+            R_m = flatten_to_288(assembled, key_cols)
+            log.info(f"  R_m: {R_m.shape}")
+
+            # Observability summary
+            for rid, _, _ in REGIME_META:
+                mask_col = f"mask_{rid}"
+                obs = int(R_m[mask_col].sum())
+                pct = 100.0 * obs / max(len(R_m), 1)
+                status = "observed" if observed_flags[rid] else "zero-filled"
+                log.info(f"    {mask_col}: {obs:,}/{len(R_m):,} rows observed ({pct:.1f}%)  [{status}]")
+
+            # -- 5. Save R_m.parquet ---------------------------------------------------
+            r_m_out = os.path.join(args.output_dir, "R_m.parquet")
+            R_m.to_parquet(r_m_out, index=False, engine="pyarrow", compression="snappy")
+            log.info(f"Saved R_m -> {r_m_out}  {R_m.shape}")
+
+            # -- 6. Load supplementary (for meta only - files stay in place) -----------
+            p_m_df = load_supplementary(args.p_m_path, "P_m")
+            d_m_df = load_supplementary(args.d_m_path, "D_m")
+            a_m_df = load_supplementary(args.a_m_path, "A_m")
+
+            # -- 7. Save tensor_meta.json ----------------------------------------------
+            meta = {
+                "R_m": {
+                    "path":       r_m_out,
+                    "total_dims": 9 * EMBED_DIM,
+                    "embed_dim_per_regime": EMBED_DIM,
+                    "slices": {
+                        rid: {
+                            "name":        name,
+                            "global_dims": dims,
+                            "source_path": getattr(args, f"{rid}_path", ""),
+                            "observed":    observed_flags[rid],
+                        }
+                        for rid, name, dims in REGIME_META
+                    },
+                },
+                "P_m": {
+                    "path": args.p_m_path,
+                    "dims": int(len([c for c in p_m_df.columns if c.startswith("phase_")])) if p_m_df is not None else 6,
+                    "exists": p_m_df is not None,
+                },
+                "D_m": {
+                    "path": args.d_m_path,
+                    "dims": int(len([c for c in d_m_df.columns if c.startswith("dyn_")])) if d_m_df is not None else 3,
+                    "exists": d_m_df is not None,
+                },
+                "A_m": {
+                    "path": args.a_m_path,
+                    "dims": int(len([c for c in a_m_df.columns if c.startswith("agency_")])) if a_m_df is not None else 3,
+                    "exists": a_m_df is not None,
+                },
+                "row_count": len(R_m),
+                "runtime_s": round(time.time() - t0, 2),
+            }
+
+            meta_out = os.path.join(args.output_dir, "tensor_meta.json")
+            with open(meta_out, "w") as f:
+                json.dump(meta, f, indent=2)
+            log.info(f"Saved tensor_meta -> {meta_out}")
+
+            # -- Summary ---------------------------------------------------------------
+            elapsed = time.time() - t0
+            log.info("=" * 60)
+            log.info(f"  DONE  ({elapsed:.1f}s)")
+            log.info(f"  R_m shape    : {R_m.shape}")
+            log.info(f"  Regimes live : {sum(observed_flags.values())}/9")
+            log.info(f"  P_m          : {'found' if p_m_df is not None else 'missing'}")
+            log.info(f"  D_m          : {'found' if d_m_df is not None else 'missing'}")
+            log.info(f"  A_m          : {'found' if a_m_df is not None else 'missing'}")
+            log.info(f"  Dim layout   : " +
+                     " | ".join(f"{rid}[{d[0]}-{d[1]}]" for rid, _, d in REGIME_META))
+            log.info("=" * 60)
+
+        if __name__ == "__main__":
+            main()
+    args:
+      - --r1_path
+      - {inputValue: r1_path}
+      - --r2_path
+      - {inputValue: r2_path}
+      - --r3_path
+      - {inputValue: r3_path}
+      - --r4_path
+      - {inputValue: r4_path}
+      - --r5_path
+      - {inputValue: r5_path}
+      - --r6_path
+      - {inputValue: r6_path}
+      - --r7_path
+      - {inputValue: r7_path}
+      - --r8_path
+      - {inputValue: r8_path}
+      - --r9_path
+      - {inputValue: r9_path}
+      - --p_m_path
+      - {inputValue: p_m_path}
+      - --d_m_path
+      - {inputValue: d_m_path}
+      - --a_m_path
+      - {inputValue: a_m_path}
+      - --output_dir
+      - {outputPath: R_m}

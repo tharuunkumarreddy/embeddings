@@ -1,0 +1,222 @@
+name: P_m - Phase Mapper
+description: >
+  Derive phase-of-cycle embeddings (P_m) from regime r1, r3, r4 embeddings.
+  Outputs p_m.parquet with 6-dim phase vectors per country/year/sector.
+
+inputs:
+  - name: r1_path
+    type: String
+    description: 'Path to r1.parquet (Political Power embeddings)'
+    default: ''
+  - name: r3_path
+    type: String
+    description: 'Path to r3.parquet (Economic Coordination embeddings)'
+    default: ''
+  - name: r4_path
+    type: String
+    description: 'Path to r4.parquet (Regulatory & Enforcement embeddings)'
+    default: ''
+  - name: countries
+    type: String
+    description: 'Comma-separated ISO3 country codes'
+    default: ''
+  - name: year_start
+    type: String
+    description: 'Start year (inclusive)'
+    default: '2010'
+  - name: year_end
+    type: String
+    description: 'End year (inclusive)'
+    default: '2025'
+
+outputs:
+  - name: p_m_data
+    type: Data
+    description: 'Phase embeddings Parquet (country | year | isic_code | isic_level | phase_0..phase_5)'
+
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:v23
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import os, json, argparse, logging, pickle
+        import numpy as np
+        import pandas as pd
+        import torch
+
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+        log = logging.getLogger("p_m")
+
+        N_PHASES = 6
+        PHASE_NAMES = [
+            "Pre-formalization", "Formalizing", "Platformizing",
+            "Fragmenting", "Stagnant Equilibrium", "Institutional Collapse",
+        ]
+
+        # -- Gaussian HMM (inlined) ----------------------------------------------------
+
+        class GaussianHMM:
+    
+            def __init__(self, n_states: int, obs_dim: int, n_iter: int = 50):
+                self.K = n_states
+                self.D = obs_dim
+                self.n_iter = n_iter
+                rng = np.random.default_rng(42)
+                self.pi    = np.ones(self.K) / self.K
+                self.A     = rng.dirichlet(np.ones(self.K), size=self.K)
+                self.means = rng.standard_normal((self.K, self.D)) * 0.1
+                self.covs  = np.stack([np.eye(self.D) for _ in range(self.K)])
+
+            def _gaussian_pdf(self, x: np.ndarray) -> np.ndarray:
+                from scipy.stats import multivariate_normal
+                liks = np.zeros((self.K, len(x)))
+                for k in range(self.K):
+                    liks[k] = multivariate_normal.pdf(
+                        x, mean=self.means[k],
+                        cov=self.covs[k] + np.eye(self.D) * 1e-4,
+                        allow_singular=True,
+                    )
+                return liks + 1e-300
+
+            def fit(self, X: np.ndarray) -> None:
+                N, D = X.shape
+                for _ in range(self.n_iter):
+                    B = self._gaussian_pdf(X)   # (K, N)
+
+                    # Forward
+                    alpha = np.zeros((N, self.K))
+                    alpha[0] = self.pi * B[:, 0]
+                    alpha[0] /= alpha[0].sum() + 1e-300
+                    for t in range(1, N):
+                        alpha[t] = (alpha[t-1] @ self.A) * B[:, t]
+                        alpha[t] /= alpha[t].sum() + 1e-300
+
+                    # Backward
+                    beta = np.ones((N, self.K))
+                    for t in range(N-2, -1, -1):
+                        beta[t] = (self.A * B[:, t+1]).sum(axis=1)
+                        beta[t] /= beta[t].sum() + 1e-300
+
+                    # Gamma (soft state occupancy)
+                    gamma = alpha * beta
+                    gamma /= (gamma.sum(axis=1, keepdims=True) + 1e-300)
+
+                    # M-step
+                    Nk = gamma.sum(axis=0) + 1e-8
+                    self.means = (gamma.T @ X) / Nk[:, None]
+                    for k in range(self.K):
+                        diff = X - self.means[k]
+                        wdiff = gamma[:, k:k+1] * diff
+                        self.covs[k] = (wdiff.T @ diff) / Nk[k]
+
+                self._last_gamma = gamma
+
+            def predict_proba(self, X: np.ndarray) -> np.ndarray:
+                B     = self._gaussian_pdf(X)
+                gamma = (self.pi[:, None] * B).T
+                gamma /= gamma.sum(axis=1, keepdims=True) + 1e-300
+                return gamma.astype(np.float32)
+
+        class PhaseMembership:
+    Auto-detect ISO3 country codes from a regime parquet.Broadcast (N, K) tensor -> DataFrame with country | year | {col_prefix}_0 ... K-1.
+            arr  = tensor.detach().numpy()
+            K    = arr.shape[1]
+            cols = [f"{col_prefix}_{i}" for i in range(K)]
+            rows = []
+            for ci, country in enumerate(countries):
+                for yr in years:
+                    row = {"country": country, "year": yr}
+                    row.update({cols[k]: float(arr[ci, k]) for k in range(K)})
+                    rows.append(row)
+            return pd.DataFrame(rows)
+
+        # -- Main ---------------------------------------------------------------------
+
+        def main():
+            ap = argparse.ArgumentParser(description="Component: Supplementary P_m")
+            ap.add_argument("--r1_path",    default="", help="Path to r1.parquet")
+            ap.add_argument("--r3_path",    default="", help="Path to r3.parquet")
+            ap.add_argument("--r4_path",    default="", help="Path to r4.parquet")
+            ap.add_argument("--countries",  default="", help="Comma-sep ISO3 codes")
+            ap.add_argument("--year_start", type=int, default=2010)
+            ap.add_argument("--year_end",   type=int, default=2025)
+            ap.add_argument("--output",     required=True, help="Output p_m.parquet")
+            args = ap.parse_args()
+
+            log.info("=" * 60)
+            log.info("  Supplementary: P_m  (Structural Phase Membership)")
+            log.info("=" * 60)
+
+            years = list(range(args.year_start, args.year_end + 1))
+
+            # -- Countries -------------------------------------------------------------
+            if args.countries:
+                countries = [c.strip() for c in args.countries.split(",")]
+            else:
+                # Auto-detect from first available parquet
+                countries = []
+                for p in [args.r1_path, args.r3_path, args.r4_path]:
+                    if p and os.path.exists(p):
+                        countries = detect_countries_from_parquet(p)
+                        break
+            N = len(countries)
+            log.info(f"Countries ({N})  Years: {len(years)}")
+
+            # -- Load regime embeddings ------------------------------------------------
+            have_inputs = (args.r1_path and args.r3_path and args.r4_path and
+                           os.path.exists(args.r1_path) and
+                           os.path.exists(args.r3_path) and
+                           os.path.exists(args.r4_path))
+
+            if have_inputs:
+                r1_emb = parquet_to_tensor(args.r1_path, countries)
+                r3_emb = parquet_to_tensor(args.r3_path, countries)
+                r4_emb = parquet_to_tensor(args.r4_path, countries)
+                log.info(f"R1: {tuple(r1_emb.shape)}  R3: {tuple(r3_emb.shape)}  R4: {tuple(r4_emb.shape)}")
+
+                pm = PhaseMembership()
+                p_m_tensor = pm.compute(r1_emb, r3_emb, r4_emb)   # (N, 6)
+                log.info(f"P_m tensor: {tuple(p_m_tensor.shape)}")
+            else:
+                log.warning("R1/R3/R4 parquets missing - P_m defaults to uniform 1/6")
+                p_m_tensor = torch.full((N, 6), 1.0 / 6.0)
+
+            # -- Output ----------------------------------------------------------------
+            p_m_df = tensor_to_df(p_m_tensor, countries, col_prefix="phase", years=years)
+            os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+            p_m_df.to_parquet(args.output, index=False, engine="pyarrow", compression="snappy")
+            log.info(f"P_m saved -> {args.output}  shape={p_m_df.shape}")
+
+            # Log dominant phase per country (first few)
+            phase_cols = [f"phase_{i}" for i in range(6)]
+            sample = p_m_df.drop_duplicates("country").head(5)
+            for _, row in sample.iterrows():
+                probs   = [row[c] for c in phase_cols]
+                dom_idx = int(np.argmax(probs))
+                log.info(f"  {row['country']}: dominant phase = {PHASE_NAMES[dom_idx]} "
+                         f"({probs[dom_idx]:.3f})")
+
+            log.info("=" * 60)
+            log.info("  P_m DONE")
+            log.info("=" * 60)
+
+        if __name__ == "__main__":
+            main()
+    args:
+      - --r1_path
+      - {inputValue: r1_path}
+      - --r3_path
+      - {inputValue: r3_path}
+      - --r4_path
+      - {inputValue: r4_path}
+      - --countries
+      - {inputValue: countries}
+      - --year_start
+      - {inputValue: year_start}
+      - --year_end
+      - {inputValue: year_end}
+      - --output
+      - {outputPath: p_m_data}

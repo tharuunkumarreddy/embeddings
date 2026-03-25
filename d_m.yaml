@@ -1,0 +1,161 @@
+name: D_m - Dynamics Mapper
+description: >
+  Derive dynamic/volatility embeddings (D_m) from the preprocessed bundle.
+  Outputs d_m.parquet with 3-dim dynamics vectors per country/year.
+
+inputs:
+  - name: bundle
+    type: String
+    description: 'Path to bundle.pkl from Preprocessor'
+  - name: countries
+    type: String
+    description: 'Comma-separated ISO3 country codes'
+    default: ''
+  - name: year_start
+    type: String
+    description: 'Start year (inclusive)'
+    default: '2010'
+  - name: year_end
+    type: String
+    description: 'End year (inclusive)'
+    default: '2025'
+
+outputs:
+  - name: d_m_data
+    type: Data
+    description: 'Dynamics embeddings Parquet (country | year | dyn_0..dyn_2)'
+
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:v23
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import os, argparse, logging, pickle
+        import numpy as np
+        import pandas as pd
+        import torch
+
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+        log = logging.getLogger("d_m")
+
+        # -- Kalman / inertia / persistence helpers (inlined) -------------------------
+
+        def kalman_velocity(series: np.ndarray, Q: float = 0.1, R: float = 1.0) -> float:
+    Inertia iota_m: exponential decay half-life of autocorrelation, clipped [0,1].
+
+            def compute(self, data_dict: dict) -> torch.Tensor:
+                N = data_dict["WEO"].shape[0]
+
+                # -- Velocity (WEO GDP growth deviation) -------------------------------
+                weo = data_dict["WEO"]   # (N, 6)
+                v_m = np.tanh((weo[:, 0] - weo[:, 0].mean()).astype(np.float32))
+
+                # -- Inertia (BIS credit-gap + informality blend) ----------------------
+                bis_credit  = data_dict["BIS_credit"][:, 0]
+                informality = data_dict["ILOSTAT"][:, 0]
+                i_m = np.array([
+                    half_life_inertia(np.array([float(bis_credit[n])] * 5))
+                    for n in range(N)
+                ], dtype=np.float32)
+                i_m = np.clip(0.6 * i_m + 0.4 * informality.astype(np.float32), 0.0, 1.0)
+
+                # -- Persistence (Hurst on FDI + wages) --------------------------------
+                fdi   = data_dict["UNCTAD_FDI"][:, 0]
+                wages = data_dict["ILOSTAT_wages"][:, 0]
+                combined    = np.stack([fdi, wages], axis=1).mean(axis=1)
+                rho_global  = hurst_persistence(combined)
+                rho_m = np.clip(
+                    rho_global + (fdi - fdi.mean()) * 0.1, 0.0, 1.0
+                ).astype(np.float32)
+
+                D_m = np.stack([v_m, i_m, rho_m], axis=1)   # (N, 3)
+                return torch.from_numpy(D_m)
+
+        # -- Helpers -------------------------------------------------------------------
+
+        def get_country_ids_from_bundle(data_dict: dict) -> list:
+            if "__countries__" in data_dict:
+                return data_dict["__countries__"]
+            for val in data_dict.values():
+                if isinstance(val, np.ndarray) and val.ndim >= 1:
+                    return [f"country_{i}" for i in range(val.shape[0])]
+            return []
+
+        def tensor_to_df(tensor: torch.Tensor, countries: list,
+                         col_prefix: str, years: list) -> pd.DataFrame:
+            arr  = tensor.detach().numpy()
+            K    = arr.shape[1]
+            cols = [f"{col_prefix}_{i}" for i in range(K)]
+            rows = []
+            for ci, country in enumerate(countries):
+                for yr in years:
+                    row = {"country": country, "year": yr}
+                    row.update({cols[k]: float(arr[ci, k]) for k in range(K)})
+                    rows.append(row)
+            return pd.DataFrame(rows)
+
+        # -- Main ---------------------------------------------------------------------
+
+        def main():
+            ap = argparse.ArgumentParser(description="Component: Supplementary D_m")
+            ap.add_argument("--bundle",     required=True, help="Path to bundle.pkl")
+            ap.add_argument("--countries",  default="",    help="Comma-sep ISO3 codes")
+            ap.add_argument("--year_start", type=int, default=2010)
+            ap.add_argument("--year_end",   type=int, default=2025)
+            ap.add_argument("--output",     required=True, help="Output d_m.parquet")
+            args = ap.parse_args()
+
+            log.info("=" * 60)
+            log.info("  Supplementary: D_m  (Market Dynamics)")
+            log.info("=" * 60)
+
+            with open(args.bundle, "rb") as f:
+                data_dict = pickle.load(f)
+            log.info(f"Bundle loaded: {len(data_dict)} keys")
+
+            countries = ([c.strip() for c in args.countries.split(",")]
+                         if args.countries else get_country_ids_from_bundle(data_dict))
+            years = list(range(args.year_start, args.year_end + 1))
+            log.info(f"Countries ({len(countries)})  Years: {len(years)}")
+
+            # -- Compute D_m ----------------------------------------------------------
+            estimator = DynamicsEstimator()
+            try:
+                d_m_tensor = estimator.compute(data_dict)   # (N, 3)
+                log.info(f"D_m tensor: {tuple(d_m_tensor.shape)}")
+            except Exception as e:
+                log.warning(f"DynamicsEstimator failed ({e}) - using zeros")
+                d_m_tensor = torch.zeros(len(countries), 3)
+
+            # -- Output ----------------------------------------------------------------
+            d_m_df = tensor_to_df(d_m_tensor, countries, col_prefix="dyn", years=years)
+            os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+            d_m_df.to_parquet(args.output, index=False, engine="pyarrow", compression="snappy")
+            log.info(f"D_m saved -> {args.output}  shape={d_m_df.shape}")
+
+            # Sample log
+            sample_countries = countries[:5] if len(countries) >= 5 else countries
+            for iso in sample_countries:
+                row = d_m_df[d_m_df["country"] == iso].iloc[0]
+                log.info(f"  {iso}: v={row['dyn_0']:.3f}  iota={row['dyn_1']:.3f}  rho={row['dyn_2']:.3f}")
+
+            log.info("=" * 60)
+            log.info("  D_m DONE")
+            log.info("=" * 60)
+
+        if __name__ == "__main__":
+            main()
+    args:
+      - --bundle
+      - {inputValue: bundle}
+      - --countries
+      - {inputValue: countries}
+      - --year_start
+      - {inputValue: year_start}
+      - --year_end
+      - {inputValue: year_end}
+      - --output
+      - {outputPath: d_m_data}

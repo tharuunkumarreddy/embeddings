@@ -1,0 +1,292 @@
+name: Source - ILOSTAT
+description: >
+  Fetches ILOSTAT labour-market data (employment, wages, labour force participation)
+  via three modes: MinIO object storage, PI API pagination, or synthetic generation.
+
+inputs:
+  - name: mode
+    type: String
+    description: 'Data fetch mode: "minio", "pi_api", or "synthetic"'
+    default: 'minio'
+  - name: countries
+    type: String
+    description: 'Comma-separated ISO3 country codes. Empty = all available.'
+    default: ''
+  - name: year_start
+    type: String
+    description: 'Start year (inclusive)'
+  - name: year_end
+    type: String
+    description: 'End year (inclusive)'
+  - name: minio_endpoint
+    type: String
+    description: 'MinIO endpoint URL'
+    default: 'https://s3.us-west-004.backblazeb2.com'
+  - name: minio_access_key
+    type: String
+    description: 'MinIO access key'
+    default: ''
+  - name: minio_secret_key
+    type: String
+    description: 'MinIO secret key'
+    default: ''
+  - name: bucket
+    type: String
+    description: 'MinIO bucket name'
+    default: 'holacracydata'
+  - name: prefix
+    type: String
+    description: 'MinIO object prefix / sub-folder'
+    default: 'connector_output'
+  - name: minio_filename
+    type: String
+    description: 'Object filename inside the MinIO bucket/prefix'
+    default: 'ilostat_output.json'
+  - name: pi_api_url
+    type: String
+    description: 'PI API base URL'
+    default: ''
+  - name: pi_access_token
+    type: String
+    description: 'Bearer token for PI API'
+    default: ''
+  - name: pi_page_size
+    type: String
+    description: 'Records per page for PI API pagination'
+    default: '2000'
+
+outputs:
+  - name: output_data
+    type: Data
+    description: 'Source data in Parquet format'
+  - name: meta
+    type: Data
+    description: 'Fetch metadata JSON'
+
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:v23
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+
+        import os, json, argparse, logging, time
+        import numpy as np
+        import pandas as pd
+
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+        log = logging.getLogger("source_ilostat")
+
+        DEFAULT_SYNTHETIC_COUNTRIES = [
+            "USA","GBR","DEU","FRA","JPN","CHN","IND","BRA","CAN","AUS",
+            "KOR","MEX","IDN","TUR","SAU","ZAF","ARG","NGA","EGY","PAK",
+            "NLD","CHE","SWE","NOR","POL","THA","MYS","PHL","VNM","BGD",
+        ]
+
+        # -- Helpers --------------------------------------------------------------------
+
+        def _make_s3_client(endpoint, access_key, secret_key):
+            import boto3
+            from botocore.config import Config as BotoConfig
+            return boto3.client(
+                "s3", endpoint_url=endpoint,
+                aws_access_key_id=access_key, aws_secret_access_key=secret_key,
+                config=BotoConfig(signature_version="s3v4",
+                                  retries={"max_attempts": 5, "mode": "adaptive"}),
+            )
+
+        def _read_raw(local_path: str, filename: str) -> pd.DataFrame:
+            if filename.endswith(".json"):
+                with open(local_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, list):
+                    return pd.json_normalize(raw)
+                if isinstance(raw, dict):
+                    for key in ("data", "results", "records", "items", "content"):
+                        if key in raw and isinstance(raw[key], list):
+                            return pd.json_normalize(raw[key])
+                    list_vals = {k: v for k, v in raw.items() if isinstance(v, list)}
+                    return pd.DataFrame(list_vals) if list_vals else pd.json_normalize([raw])
+            elif filename.endswith(".csv"):
+                return pd.read_csv(local_path, low_memory=False)
+            raise ValueError(f"Unsupported format: {filename}")
+
+        def _save_parquet(df: pd.DataFrame, path: str):
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            for col in df.columns:
+                if df[col].dtype == object:
+                    sample = df[col].dropna().head(10)
+                    if sample.apply(lambda x: isinstance(x, (list, dict))).any():
+                        df[col] = df[col].apply(
+                            lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
+            df.to_parquet(path, index=False, engine="pyarrow", compression="snappy")
+            log.info(f"Saved -> {path}  ({len(df)} rows x {len(df.columns)} cols)")
+
+        # -- PI API ---------------------------------------------------------------------
+
+        def fetch_from_pi_api(api_url: str, access_token: str, page_size: int = 2000) -> pd.DataFrame:
+            import requests
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+
+            PI_MAX = 2000
+            page_size = min(page_size, PI_MAX)
+            session = requests.Session()
+            retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+            session.mount("https://", HTTPAdapter(max_retries=retries))
+            session.mount("http://", HTTPAdapter(max_retries=retries))
+
+            headers = {}
+            if access_token:
+                token = access_token
+                if os.path.exists(access_token):
+                    with open(access_token) as f:
+                        token = f.read().strip()
+                headers["Authorization"] = f"Bearer {token}"
+
+            all_records, page = [], 1
+            while True:
+                resp = session.get(api_url, headers=headers,
+                                   params={"pageSize": page_size, "page": page}, timeout=300)
+                resp.raise_for_status()
+                body = resp.json()
+                records = body.get("data", body) if isinstance(body, dict) else body
+                if not records:
+                    break
+                all_records.extend(records if isinstance(records, list) else [records])
+                if len(records) < page_size:
+                    break
+                page += 1
+                log.info(f"  PI API page {page}  total_so_far={len(all_records)}")
+
+            if not all_records:
+                return pd.DataFrame()
+            return pd.json_normalize(all_records)
+
+        # -- MinIO download -------------------------------------------------------------
+
+        def download_from_minio(endpoint, access_key, secret_key, bucket, prefix,
+                                output_path, minio_filename, meta_path="") -> dict:
+            import tempfile
+            suffix = ".json" if minio_filename.endswith(".json") else ".csv"
+            object_key = f"{prefix}/{minio_filename}".lstrip("/")
+            log.info(f"Downloading s3://{bucket}/{object_key}")
+            s3 = _make_s3_client(endpoint, access_key, secret_key)
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                t0 = time.time()
+                s3.download_file(bucket, object_key, tmp_path)
+                raw_size = os.path.getsize(tmp_path)
+                log.info(f"Downloaded {raw_size/1e6:.1f} MB in {time.time()-t0:.1f}s")
+                df = _read_raw(tmp_path, minio_filename)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            _save_parquet(df, output_path)
+            meta = {"source": "ilostat", "filename": minio_filename,
+                    "rows": len(df), "columns": list(df.columns), "output_path": output_path}
+            if meta_path:
+                os.makedirs(os.path.dirname(meta_path) or ".", exist_ok=True)
+                with open(meta_path, "w") as f:
+                    json.dump(meta, f, indent=2)
+            return meta
+
+        # -- Synthetic data generation --------------------------------------------------
+
+        def generate_synthetic(countries: list, year_start: int, year_end: int) -> pd.DataFrame:
+            rows = []
+            for iso in countries:
+                for yr in range(year_start, year_end + 1):
+                    rows.append({
+                        "ref_area": iso, "year": yr,
+                        "employment_rate":           float(np.random.uniform(55, 80)),
+                        "labor_force_participation": float(np.random.uniform(55, 85)),
+                        "self_employment_rate":      float(np.random.uniform(5, 50)),
+                        "vulnerable_employment":     float(np.random.uniform(2, 60)),
+                        "wage_gini":                 float(np.random.uniform(0.25, 0.55)),
+                        "real_wage_growth":          float(np.random.uniform(-3, 6)),
+                        "minimum_wage_coverage":     float(np.random.uniform(20, 90)),
+                    })
+            return pd.DataFrame(rows)
+
+        # -- Main -----------------------------------------------------------------------
+
+        def main():
+            ap = argparse.ArgumentParser(description="Source component: ILOSTAT")
+            ap.add_argument("--mode",             choices=["minio", "pi_api", "synthetic"], default="minio")
+            ap.add_argument("--countries",        default="", help="Comma-sep ISO3 codes (optional)")
+            ap.add_argument("--year_start",       type=int, required=True)
+            ap.add_argument("--year_end",         type=int, required=True)
+            ap.add_argument("--output_path",      required=True)
+            ap.add_argument("--minio_endpoint",   default="")
+            ap.add_argument("--minio_access_key", default="")
+            ap.add_argument("--minio_secret_key", default="")
+            ap.add_argument("--bucket",           default="")
+            ap.add_argument("--prefix",           default="")
+            ap.add_argument("--minio_filename",   default="")
+            ap.add_argument("--pi_api_url",       default="")
+            ap.add_argument("--pi_access_token",  default="")
+            ap.add_argument("--pi_page_size",     type=int, default=2000)
+            ap.add_argument("--meta_path",        default="")
+            args = ap.parse_args()
+
+            log.info("=" * 60)
+            log.info("  SOURCE: ILOSTAT")
+            log.info(f"  mode={args.mode}")
+            log.info("=" * 60)
+
+            if args.mode == "synthetic":
+                countries = [c.strip() for c in args.countries.split(",")] if args.countries else DEFAULT_SYNTHETIC_COUNTRIES
+                df = generate_synthetic(countries, args.year_start, args.year_end)
+                _save_parquet(df, args.output_path)
+            elif args.mode == "pi_api":
+                df = fetch_from_pi_api(args.pi_api_url, args.pi_access_token, args.pi_page_size)
+                _save_parquet(df, args.output_path)
+                if args.meta_path:
+                    meta = {"source": "ilostat", "mode": "pi_api",
+                            "rows": len(df), "columns": list(df.columns), "output_path": args.output_path}
+                    os.makedirs(os.path.dirname(args.meta_path) or ".", exist_ok=True)
+                    with open(args.meta_path, "w") as f:
+                        json.dump(meta, f, indent=2)
+            else:  # minio
+                download_from_minio(
+                    args.minio_endpoint, args.minio_access_key, args.minio_secret_key,
+                    args.bucket, args.prefix, args.output_path, args.minio_filename, args.meta_path,
+                )
+
+        if __name__ == "__main__":
+            main()
+    args:
+      - --mode
+      - {inputValue: mode}
+      - --countries
+      - {inputValue: countries}
+      - --year_start
+      - {inputValue: year_start}
+      - --year_end
+      - {inputValue: year_end}
+      - --minio_endpoint
+      - {inputValue: minio_endpoint}
+      - --minio_access_key
+      - {inputValue: minio_access_key}
+      - --minio_secret_key
+      - {inputValue: minio_secret_key}
+      - --bucket
+      - {inputValue: bucket}
+      - --prefix
+      - {inputValue: prefix}
+      - --minio_filename
+      - {inputValue: minio_filename}
+      - --pi_api_url
+      - {inputValue: pi_api_url}
+      - --pi_access_token
+      - {inputValue: pi_access_token}
+      - --pi_page_size
+      - {inputValue: pi_page_size}
+      - --output_path
+      - {outputPath: output_data}
+      - --meta_path
+      - {outputPath: meta}
