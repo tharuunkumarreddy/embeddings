@@ -1,8 +1,5 @@
 name: Regime R4 - Regulatory & Enforcement
-description: >
-  Latent Factor Model with entry, enforcement, and integrated structured sub-heads. embed_dim=32. REGIME_DIMS: [96, 128].
-  Accepts bundle.pkl from Preprocessor and optional c_m_bundle.parquet for sector gating.
-
+description: Latent Factor Model with entry, enforcement, and integrated structured sub-heads. embed_dim=32. REGIME_DIMS: [96, 128].
 inputs:
   - name: regime_id
     type: String
