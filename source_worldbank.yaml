@@ -42,7 +42,7 @@ inputs:
     default: 'connector_output'
   - name: minio_filename
     type: String
-    description: 'Object filename inside the MinIO bucket/prefix (e.g. worldbank_final_output.json)'
+    description: 'Object filename inside the MinIO bucket/prefix'
     default: 'worldbank_final_output.json'
   - name: pi_api_url
     type: String
@@ -73,6 +73,8 @@ implementation:
       - -u
       - -c
       - |
+        import subprocess, sys
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "boto3", "--quiet"])
 
         import os, json, argparse, logging, time
         import numpy as np
@@ -93,18 +95,122 @@ implementation:
             import boto3
             from botocore.config import Config as BotoConfig
             return boto3.client(
-                "s3",
-                endpoint_url=endpoint,
-                aws_access_key_id=access_key,
-                aws_secret_access_key=secret_key,
-                config=BotoConfig(
-                    signature_version="s3v4",
-                    retries={"max_attempts": 5, "mode": "adaptive"},
-                ),
+                "s3", endpoint_url=endpoint,
+                aws_access_key_id=access_key, aws_secret_access_key=secret_key,
+                config=BotoConfig(signature_version="s3v4",
+                                  retries={"max_attempts": 5, "mode": "adaptive"}),
             )
 
         def _read_raw(local_path: str, filename: str) -> pd.DataFrame:
-    Download worldbank_final_output.json from MinIO -> save as parquet.Generate synthetic World Bank data (WGI, WDI, B_READY columns).
+            if filename.endswith(".json"):
+                with open(local_path, "r", encoding="utf-8") as f:
+                    raw_text = f.read()
+                try:
+                    raw = json.loads(raw_text)
+                    if isinstance(raw, list):
+                        return pd.json_normalize(raw)
+                    if isinstance(raw, dict):
+                        for key in ("data", "results", "records", "items", "content"):
+                            if key in raw and isinstance(raw[key], list):
+                                return pd.json_normalize(raw[key])
+                        list_vals = {k: v for k, v in raw.items() if isinstance(v, list)}
+                        return pd.DataFrame(list_vals) if list_vals else pd.json_normalize([raw])
+                except json.JSONDecodeError:
+                    log.info("Standard JSON parse failed, trying NDJSON format...")
+                    records = []
+                    for line in raw_text.splitlines():
+                        line = line.strip()
+                        if line:
+                            records.append(json.loads(line))
+                    return pd.json_normalize(records)
+            elif filename.endswith(".csv"):
+                return pd.read_csv(local_path, low_memory=False)
+            raise ValueError(f"Unsupported format: {filename}")
+
+        def _save_parquet(df: pd.DataFrame, path: str):
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            for col in df.columns:
+                if df[col].dtype == object:
+                    sample = df[col].dropna().head(10)
+                    if sample.apply(lambda x: isinstance(x, (list, dict))).any():
+                        df[col] = df[col].apply(
+                            lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
+            df.to_parquet(path, index=False, engine="pyarrow", compression="snappy")
+            log.info(f"Saved -> {path}  ({len(df)} rows x {len(df.columns)} cols)")
+
+        # -- PI API ---------------------------------------------------------------------
+
+        def fetch_from_pi_api(api_url: str, access_token: str, page_size: int = 2000) -> pd.DataFrame:
+            import requests
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+
+            PI_MAX = 2000
+            page_size = min(page_size, PI_MAX)
+            session = requests.Session()
+            retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+            session.mount("https://", HTTPAdapter(max_retries=retries))
+            session.mount("http://", HTTPAdapter(max_retries=retries))
+
+            headers = {}
+            if access_token:
+                token = access_token
+                if os.path.exists(access_token):
+                    with open(access_token) as f:
+                        token = f.read().strip()
+                headers["Authorization"] = f"Bearer {token}"
+
+            all_records, page = [], 1
+            while True:
+                resp = session.get(api_url, headers=headers,
+                                   params={"pageSize": page_size, "page": page}, timeout=300)
+                resp.raise_for_status()
+                body = resp.json()
+                records = body.get("data", body) if isinstance(body, dict) else body
+                if not records:
+                    break
+                all_records.extend(records if isinstance(records, list) else [records])
+                if len(records) < page_size:
+                    break
+                page += 1
+                log.info(f"  PI API page {page}  total_so_far={len(all_records)}")
+
+            if not all_records:
+                return pd.DataFrame()
+            return pd.json_normalize(all_records)
+
+        # -- MinIO download -------------------------------------------------------------
+
+        def download_from_minio(endpoint, access_key, secret_key, bucket, prefix,
+                                minio_filename, output_path, meta_path="") -> dict:
+            import tempfile
+            suffix = ".json" if minio_filename.endswith(".json") else ".csv"
+            object_key = f"{prefix}/{minio_filename}".lstrip("/")
+            log.info(f"Downloading s3://{bucket}/{object_key}")
+            s3 = _make_s3_client(endpoint, access_key, secret_key)
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                t0 = time.time()
+                s3.download_file(bucket, object_key, tmp_path)
+                raw_size = os.path.getsize(tmp_path)
+                log.info(f"Downloaded {raw_size/1e6:.1f} MB in {time.time()-t0:.1f}s")
+                df = _read_raw(tmp_path, minio_filename)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            _save_parquet(df, output_path)
+            meta = {"source": "worldbank", "filename": minio_filename,
+                    "rows": len(df), "columns": list(df.columns), "output_path": output_path}
+            if meta_path:
+                os.makedirs(os.path.dirname(meta_path) or ".", exist_ok=True)
+                with open(meta_path, "w") as f:
+                    json.dump(meta, f, indent=2)
+            return meta
+
+        # -- Synthetic data generation --------------------------------------------------
+
+        def generate_synthetic(countries: list, year_start: int, year_end: int) -> pd.DataFrame:
             rows = []
             for iso in countries:
                 for yr in range(year_start, year_end + 1):
@@ -139,7 +245,7 @@ implementation:
             ap.add_argument("--countries",        default="", help="Comma-sep ISO3 codes (optional)")
             ap.add_argument("--year_start",       type=int, required=True)
             ap.add_argument("--year_end",         type=int, required=True)
-            ap.add_argument("--output_path",      required=True, help="Output .parquet path")
+            ap.add_argument("--output_path",      required=True)
             ap.add_argument("--minio_endpoint",   default="")
             ap.add_argument("--minio_access_key", default="")
             ap.add_argument("--minio_secret_key", default="")
