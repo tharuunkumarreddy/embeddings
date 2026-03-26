@@ -1,7 +1,5 @@
 name: Regime R9 - Temporal & Shock
-description: >
-  BOCPD change-point features + linear SSM (Kalman). embed_dim=32. REGIME_DIMS: [256, 288].
-
+description: BOCPD change-point features + linear SSM (Kalman). embed_dim=32. REGIME_DIMS: [256, 288].
 inputs:
   - name: regime_id
     type: String
