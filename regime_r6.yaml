@@ -1,7 +1,5 @@
 name: Regime R6 - Operational Reality
-description: >
-  SVD-initialised factor model on ILOSTAT / UNIDO-IPI / GDELT. embed_dim=32. REGIME_DIMS: [160, 192].
-
+description: SVD-initialised factor model on ILOSTAT / UNIDO-IPI / GDELT. embed_dim=32. REGIME_DIMS: [160, 192].
 inputs:
   - name: regime_id
     type: String
