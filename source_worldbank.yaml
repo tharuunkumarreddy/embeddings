@@ -118,10 +118,19 @@ implementation:
                 except json.JSONDecodeError:
                     log.info("Standard JSON parse failed, trying NDJSON format...")
                     records = []
-                    for line in raw_text.splitlines():
+                    skipped = 0
+                    for i, line in enumerate(raw_text.splitlines()):
                         line = line.strip()
-                        if line:
+                        if not line:
+                            continue
+                        try:
                             records.append(json.loads(line))
+                        except json.JSONDecodeError as e:
+                            log.warning(f"Skipping malformed line {i+1}: {e}")
+                            skipped += 1
+                    log.info(f"NDJSON parsed {len(records)} records, skipped {skipped} malformed lines")
+                    if not records:
+                        raise ValueError("NDJSON parse produced 0 records — file may be corrupt")
                     return pd.json_normalize(records)
             elif filename.endswith(".csv"):
                 return pd.read_csv(local_path, low_memory=False)
@@ -133,8 +142,12 @@ implementation:
                 if df[col].dtype == object:
                     sample = df[col].dropna().head(10)
                     if sample.apply(lambda x: isinstance(x, (list, dict))).any():
+                        # Serialize nested lists/dicts to JSON strings
                         df[col] = df[col].apply(
                             lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
+                    else:
+                        # Try coercing string-numeric columns to float
+                        df[col] = pd.to_numeric(df[col], errors="ignore")
             df.to_parquet(path, index=False, engine="pyarrow", compression="snappy")
             log.info(f"Saved -> {path}  ({len(df)} rows x {len(df.columns)} cols)")
 
