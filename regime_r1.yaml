@@ -1,8 +1,6 @@
 name: Regime R1 - Political Power
-description: >
-  Multi-View VAE across 5 political sources (WGI, IMF_ArtIV, GDELT_govt, OECD_GOV, WITS_policy). embed_dim=32. REGIME_DIMS: [0, 32].
-  Accepts bundle.pkl from Preprocessor and optional c_m_bundle.parquet for sector gating.
-
+description: Multi-View VAE across 5 political sources (WGI, IMF_ArtIV, GDELT_govt, OECD_GOV, WITS_policy). embed_dim=32. REGIME_DIMS: [0, 32].
+  
 inputs:
   - name: regime_id
     type: String
