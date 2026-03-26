@@ -1,7 +1,5 @@
 name: Regime R8 - Incentive & Rent
-description: >
-  Multi-View VAE (SEC / BIS / ILOSTAT / OECD). embed_dim=32. REGIME_DIMS: [224, 256].
-
+description: Multi-View VAE (SEC / BIS / ILOSTAT / OECD). embed_dim=32. REGIME_DIMS: [224, 256].
 inputs:
   - name: regime_id
     type: String
