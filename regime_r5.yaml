@@ -1,8 +1,5 @@
 name: Regime R5 - Technological Production
-description: >
-  3-branch contrastive representation learning with sub, digital, and standardisation sub-heads. embed_dim=32. REGIME_DIMS: [128, 160].
-  Accepts bundle.pkl from Preprocessor and optional c_m_bundle.parquet for sector gating.
-
+description: 3-branch contrastive representation learning with sub, digital, and standardisation sub-heads. embed_dim=32. REGIME_DIMS: [128, 160].
 inputs:
   - name: regime_id
     type: String
