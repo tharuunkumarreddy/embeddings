@@ -1,8 +1,5 @@
 name: Regime R2 - Measurement & Statistical
-description: >
-  BOCPD change-point flags fed into a VAE for statistical quality embedding. embed_dim=32. REGIME_DIMS: [32, 64].
-  Accepts bundle.pkl from Preprocessor and optional c_m_bundle.parquet for sector gating.
-
+description: BOCPD change-point flags fed into a VAE for statistical quality embedding. embed_dim=32. REGIME_DIMS: [32, 64].
 inputs:
   - name: regime_id
     type: String
