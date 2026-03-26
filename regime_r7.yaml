@@ -1,7 +1,5 @@
 name: Regime R7 - Narrative & Legitimacy
-description: >
-  Contrastive temporal GRU (GDELT + SEC-8K) with env sub-head. embed_dim=32. REGIME_DIMS: [192, 224].
-
+description: Contrastive temporal GRU (GDELT + SEC-8K) with env sub-head. embed_dim=32. REGIME_DIMS: [192, 224].
 inputs:
   - name: regime_id
     type: String
