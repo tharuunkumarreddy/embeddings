@@ -105,11 +105,17 @@ implementation:
 
         def _read_raw(local_path: str, filename: str) -> pd.DataFrame:
             if filename.endswith(".json"):
-                with open(local_path, "r", encoding="utf-8") as f:
-                    raw_text = f.read()
-                # Try standard JSON first
+                # Try NDJSON first — memory efficient, handles large files without full RAM load
                 try:
-                    raw = json.loads(raw_text)
+                    df = pd.read_json(local_path, lines=True, dtype=False)
+                    log.info(f"NDJSON read {len(df)} records via pd.read_json")
+                    return df
+                except Exception:
+                    pass
+                # Fallback: standard JSON (safe only for small files)
+                try:
+                    with open(local_path, "r", encoding="utf-8") as f:
+                        raw = json.load(f)
                     if isinstance(raw, list):
                         return pd.json_normalize(raw)
                     if isinstance(raw, dict):
@@ -118,24 +124,8 @@ implementation:
                                 return pd.json_normalize(raw[key])
                         list_vals = {k: v for k, v in raw.items() if isinstance(v, list)}
                         return pd.DataFrame(list_vals) if list_vals else pd.json_normalize([raw])
-                except json.JSONDecodeError:
-                    # Fallback: NDJSON (newline-delimited JSON) - one object per line
-                    log.info("Standard JSON parse failed, trying NDJSON format...")
-                    records = []
-                    skipped = 0
-                    for i, line in enumerate(raw_text.splitlines()):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            records.append(json.loads(line))
-                        except json.JSONDecodeError as e:
-                            log.warning(f"Skipping malformed line {i+1}: {e}")
-                            skipped += 1
-                    log.info(f"NDJSON parsed {len(records)} records, skipped {skipped} malformed lines")
-                    if not records:
-                        raise ValueError("NDJSON parse produced 0 records — file may be corrupt")
-                    return pd.json_normalize(records)
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"File is neither valid NDJSON nor standard JSON: {e}")
             elif filename.endswith(".csv"):
                 return pd.read_csv(local_path, low_memory=False)
             raise ValueError(f"Unsupported format: {filename}")
@@ -146,8 +136,12 @@ implementation:
                 if df[col].dtype == object:
                     sample = df[col].dropna().head(10)
                     if sample.apply(lambda x: isinstance(x, (list, dict))).any():
+                        # Serialize nested lists/dicts to JSON strings
                         df[col] = df[col].apply(
                             lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
+                    else:
+                        # Try coercing string-numeric columns to float
+                        df[col] = pd.to_numeric(df[col], errors="ignore")
             df.to_parquet(path, index=False, engine="pyarrow", compression="snappy")
             log.info(f"Saved -> {path}  ({len(df)} rows x {len(df.columns)} cols)")
 
@@ -240,7 +234,7 @@ implementation:
                         })
             return pd.DataFrame(rows)
 
-        # -- Main -----------------------------------------------------------------------
+        # -- Synthetic data generation --------------------------------------------------
 
         def main():
             ap = argparse.ArgumentParser(description="Source component: BIS")
