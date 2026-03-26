@@ -114,12 +114,38 @@ implementation:
                         df_chunk[col] = pd.to_numeric(df_chunk[col], errors="ignore")
             return df_chunk
 
+        def _cast_table_to_schema(table, file_schema):
+            import pyarrow as pa
+            new_columns = {}
+            for i in range(len(file_schema)):
+                field = file_schema.field(i)
+                name = field.name
+                if name in table.schema.names:
+                    col = table.column(name)
+                    if col.type != field.type:
+                        try:
+                            col = col.cast(field.type, safe=False)
+                        except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+                            log.warning(
+                                f"Column '{name}': cannot cast {col.type} -> {field.type}, "
+                                f"filling with nulls."
+                            )
+                            col = pa.array([None] * len(table), type=field.type)
+                    new_columns[name] = col
+                else:
+                    log.warning(f"Column '{name}' missing in chunk, filling with nulls.")
+                    new_columns[name] = pa.array([None] * len(table), type=field.type)
+
+            arrays = [new_columns[file_schema.field(i).name] for i in range(len(file_schema))]
+            return pa.table(arrays, schema=file_schema)
+
         def _stream_ndjson_to_parquet(local_path: str, output_path: str) -> tuple:
             import pyarrow as pa
             import pyarrow.parquet as pq
 
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
             writer = None
+            file_schema = None          # locked on first chunk
             total_rows = 0
             columns = []
             chunk_size = 50000
@@ -139,9 +165,16 @@ implementation:
                     if len(chunk) >= chunk_size:
                         df_chunk = _coerce_chunk(pd.json_normalize(chunk))
                         table = pa.Table.from_pandas(df_chunk, preserve_index=False)
+
                         if writer is None:
-                            writer = pq.ParquetWriter(output_path, table.schema, compression="snappy")
+                            # Lock the schema on the very first chunk
+                            file_schema = table.schema
+                            writer = pq.ParquetWriter(output_path, file_schema, compression="snappy")
                             columns = list(df_chunk.columns)
+                        else:
+                            # Cast every subsequent chunk to the locked schema
+                            table = _cast_table_to_schema(table, file_schema)
+
                         writer.write_table(table)
                         total_rows += len(df_chunk)
                         log.info(f"  Written {total_rows} rows so far...")
@@ -152,8 +185,11 @@ implementation:
                     df_chunk = _coerce_chunk(pd.json_normalize(chunk))
                     table = pa.Table.from_pandas(df_chunk, preserve_index=False)
                     if writer is None:
-                        writer = pq.ParquetWriter(output_path, table.schema, compression="snappy")
+                        file_schema = table.schema
+                        writer = pq.ParquetWriter(output_path, file_schema, compression="snappy")
                         columns = list(df_chunk.columns)
+                    else:
+                        table = _cast_table_to_schema(table, file_schema)
                     writer.write_table(table)
                     total_rows += len(df_chunk)
 
@@ -193,6 +229,17 @@ implementation:
             df = _coerce_chunk(df)
             df.to_parquet(path, index=False, engine="pyarrow", compression="snappy")
             log.info(f"Saved -> {path}  ({len(df)} rows x {len(df.columns)} cols)")
+
+        def _write_meta(meta: dict, meta_path: str):
+            #Always write meta; creates parent dirs, never raises.#
+            try:
+                if meta_path:
+                    os.makedirs(os.path.dirname(meta_path) or ".", exist_ok=True)
+                    with open(meta_path, "w") as f:
+                        json.dump(meta, f, indent=2)
+                    log.info(f"Meta written -> {meta_path}")
+            except Exception as e:
+                log.warning(f"Could not write meta to {meta_path}: {e}")
 
         # -- PI API ---------------------------------------------------------------------
 
@@ -244,6 +291,18 @@ implementation:
             object_key = f"{prefix}/{minio_filename}".lstrip("/")
             log.info(f"Downloading s3://{bucket}/{object_key}")
             s3 = _make_s3_client(endpoint, access_key, secret_key)
+
+            # Pre-create meta output dir so Argo can always find the artifact path
+            if meta_path:
+                os.makedirs(os.path.dirname(meta_path) or ".", exist_ok=True)
+
+            meta = {
+                "source": "bis", "filename": minio_filename,
+                "rows": 0, "columns": [], "output_path": output_path,
+                "status": "started",
+            }
+            _write_meta(meta, meta_path)   # write early so artifact dir exists
+
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                 tmp_path = tmp.name
             try:
@@ -251,21 +310,26 @@ implementation:
                 s3.download_file(bucket, object_key, tmp_path)
                 raw_size = os.path.getsize(tmp_path)
                 log.info(f"Downloaded {raw_size/1e6:.1f} MB in {time.time()-t0:.1f}s")
+
                 if minio_filename.endswith(".json"):
                     total_rows, columns = _stream_ndjson_to_parquet(tmp_path, output_path)
                 else:
                     df = pd.read_csv(tmp_path, low_memory=False)
                     _save_parquet(df, output_path)
                     total_rows, columns = len(df), list(df.columns)
+
+                meta.update({
+                    "rows": total_rows, "columns": columns, "status": "success"
+                })
+            except Exception as e:
+                meta["status"] = f"error: {e}"
+                _write_meta(meta, meta_path)
+                raise
             finally:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
-            meta = {"source": "bis", "filename": minio_filename,
-                    "rows": total_rows, "columns": columns, "output_path": output_path}
-            if meta_path:
-                os.makedirs(os.path.dirname(meta_path) or ".", exist_ok=True)
-                with open(meta_path, "w") as f:
-                    json.dump(meta, f, indent=2)
+
+            _write_meta(meta, meta_path)
             return meta
 
         # -- Synthetic data generation --------------------------------------------------
@@ -317,19 +381,28 @@ implementation:
                 countries = [c.strip() for c in args.countries.split(",")] if args.countries else DEFAULT_SYNTHETIC_COUNTRIES
                 df = generate_synthetic(countries, args.year_start, args.year_end)
                 _save_parquet(df, args.output_path)
+                meta = {
+                    "source": "bis", "mode": "synthetic",
+                    "rows": len(df), "columns": list(df.columns),
+                    "output_path": args.output_path, "status": "success",
+                }
+                _write_meta(meta, args.meta_path)
+
             elif args.mode == "pi_api":
                 df = fetch_from_pi_api(args.pi_api_url, args.pi_access_token, args.pi_page_size)
                 _save_parquet(df, args.output_path)
-                if args.meta_path:
-                    meta = {"source": "bis", "mode": "pi_api",
-                            "rows": len(df), "columns": list(df.columns), "output_path": args.output_path}
-                    os.makedirs(os.path.dirname(args.meta_path) or ".", exist_ok=True)
-                    with open(args.meta_path, "w") as f:
-                        json.dump(meta, f, indent=2)
+                meta = {
+                    "source": "bis", "mode": "pi_api",
+                    "rows": len(df), "columns": list(df.columns),
+                    "output_path": args.output_path, "status": "success",
+                }
+                _write_meta(meta, args.meta_path)
+
             else:  # minio
                 download_from_minio(
                     args.minio_endpoint, args.minio_access_key, args.minio_secret_key,
-                    args.bucket, args.prefix, args.minio_filename, args.output_path, args.meta_path,
+                    args.bucket, args.prefix, args.minio_filename,
+                    args.output_path, args.meta_path,
                 )
 
         if __name__ == "__main__":
