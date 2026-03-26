@@ -77,6 +77,7 @@ implementation:
         import subprocess, sys
         subprocess.check_call([sys.executable, "-m", "pip", "install", "boto3", "--quiet"])
         print("BOOTSTRAP DONE", flush=True)
+
         import os, json, argparse, logging, time
         import numpy as np
         import pandas as pd
@@ -105,15 +106,27 @@ implementation:
         def _read_raw(local_path: str, filename: str) -> pd.DataFrame:
             if filename.endswith(".json"):
                 with open(local_path, "r", encoding="utf-8") as f:
-                    raw = json.load(f)
-                if isinstance(raw, list):
-                    return pd.json_normalize(raw)
-                if isinstance(raw, dict):
-                    for key in ("data", "results", "records", "items", "content"):
-                        if key in raw and isinstance(raw[key], list):
-                            return pd.json_normalize(raw[key])
-                    list_vals = {k: v for k, v in raw.items() if isinstance(v, list)}
-                    return pd.DataFrame(list_vals) if list_vals else pd.json_normalize([raw])
+                    raw_text = f.read()
+                # Try standard JSON first
+                try:
+                    raw = json.loads(raw_text)
+                    if isinstance(raw, list):
+                        return pd.json_normalize(raw)
+                    if isinstance(raw, dict):
+                        for key in ("data", "results", "records", "items", "content"):
+                            if key in raw and isinstance(raw[key], list):
+                                return pd.json_normalize(raw[key])
+                        list_vals = {k: v for k, v in raw.items() if isinstance(v, list)}
+                        return pd.DataFrame(list_vals) if list_vals else pd.json_normalize([raw])
+                except json.JSONDecodeError:
+                    # Fallback: NDJSON (newline-delimited JSON) - one object per line
+                    log.info("Standard JSON parse failed, trying NDJSON format...")
+                    records = []
+                    for line in raw_text.splitlines():
+                        line = line.strip()
+                        if line:
+                            records.append(json.loads(line))
+                    return pd.json_normalize(records)
             elif filename.endswith(".csv"):
                 return pd.read_csv(local_path, low_memory=False)
             raise ValueError(f"Unsupported format: {filename}")
@@ -202,7 +215,6 @@ implementation:
         # -- Synthetic data generation --------------------------------------------------
 
         def generate_synthetic(countries: list, year_start: int, year_end: int) -> pd.DataFrame:
-            
             rows = []
             for iso in countries:
                 for yr in range(year_start, year_end + 1):
