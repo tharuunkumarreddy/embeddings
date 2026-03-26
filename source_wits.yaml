@@ -1,8 +1,5 @@
 name: Source - WITS
-description: >
-  Downloads or generates WITS data (tariffs, NTMs, trade restrictiveness).
-  Supports three modes: minio (download from MinIO/B2), pi_api (fetch from PI API),
-  or synthetic (generate random WITS annual data for testing).
+description: Downloads or generates WITS data (tariffs, NTMs, trade restrictiveness).Supports three modes: minio (download from MinIO/B2), pi_api (fetch from PI API), or synthetic (generate random WITS annual data for testing).
 
 inputs:
   - name: mode
