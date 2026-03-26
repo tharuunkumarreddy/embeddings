@@ -1,9 +1,9 @@
 name: Source - BIS
-description: >
+description: >-
   Independent Elyra/Kubeflow component. Three modes:
-  1. minio     : downloads bis_final.json from MinIO -> parquet
-  2. pi_api    : fetches all data from PI API endpoint -> parquet
-  3. synthetic : generates synthetic BIS monthly data  -> parquet
+  1. minio - downloads bis_final.json from MinIO -> parquet
+  2. pi_api - fetches all data from PI API endpoint -> parquet
+  3. synthetic - generates synthetic BIS monthly data -> parquet
 
 inputs:
   - name: mode
@@ -42,7 +42,7 @@ inputs:
     default: 'connector_output'
   - name: minio_filename
     type: String
-    description: 'Object filename inside the MinIO bucket/prefix (e.g. worldbank_final_output.json)'
+    description: 'Object filename inside the MinIO bucket/prefix'
     default: 'bis_final.json'
   - name: pi_api_url
     type: String
@@ -103,16 +103,74 @@ implementation:
                                   retries={"max_attempts": 5, "mode": "adaptive"}),
             )
 
+        def _coerce_chunk(df_chunk: pd.DataFrame) -> pd.DataFrame:
+            for col in df_chunk.columns:
+                if df_chunk[col].dtype == object:
+                    sample = df_chunk[col].dropna().head(5)
+                    if sample.apply(lambda x: isinstance(x, (list, dict))).any():
+                        df_chunk[col] = df_chunk[col].apply(
+                            lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
+                    else:
+                        df_chunk[col] = pd.to_numeric(df_chunk[col], errors="ignore")
+            return df_chunk
+
+        def _stream_ndjson_to_parquet(local_path: str, output_path: str) -> tuple:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            writer = None
+            total_rows = 0
+            columns = []
+            chunk_size = 50000
+
+            with open(local_path, "r", encoding="utf-8") as f:
+                chunk = []
+                for i, line in enumerate(f):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        chunk.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        log.warning(f"Skipping malformed line {i+1}")
+                        continue
+
+                    if len(chunk) >= chunk_size:
+                        df_chunk = _coerce_chunk(pd.json_normalize(chunk))
+                        table = pa.Table.from_pandas(df_chunk, preserve_index=False)
+                        if writer is None:
+                            writer = pq.ParquetWriter(output_path, table.schema, compression="snappy")
+                            columns = list(df_chunk.columns)
+                        writer.write_table(table)
+                        total_rows += len(df_chunk)
+                        log.info(f"  Written {total_rows} rows so far...")
+                        chunk = []
+
+                # Write remaining chunk
+                if chunk:
+                    df_chunk = _coerce_chunk(pd.json_normalize(chunk))
+                    table = pa.Table.from_pandas(df_chunk, preserve_index=False)
+                    if writer is None:
+                        writer = pq.ParquetWriter(output_path, table.schema, compression="snappy")
+                        columns = list(df_chunk.columns)
+                    writer.write_table(table)
+                    total_rows += len(df_chunk)
+
+            if writer:
+                writer.close()
+
+            log.info(f"Saved -> {output_path}  ({total_rows} rows)")
+            return total_rows, columns
+
         def _read_raw(local_path: str, filename: str) -> pd.DataFrame:
             if filename.endswith(".json"):
-                # Try NDJSON first — memory efficient, handles large files without full RAM load
                 try:
                     df = pd.read_json(local_path, lines=True, dtype=False)
                     log.info(f"NDJSON read {len(df)} records via pd.read_json")
                     return df
                 except Exception:
                     pass
-                # Fallback: standard JSON (safe only for small files)
                 try:
                     with open(local_path, "r", encoding="utf-8") as f:
                         raw = json.load(f)
@@ -132,16 +190,7 @@ implementation:
 
         def _save_parquet(df: pd.DataFrame, path: str):
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            for col in df.columns:
-                if df[col].dtype == object:
-                    sample = df[col].dropna().head(10)
-                    if sample.apply(lambda x: isinstance(x, (list, dict))).any():
-                        # Serialize nested lists/dicts to JSON strings
-                        df[col] = df[col].apply(
-                            lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
-                    else:
-                        # Try coercing string-numeric columns to float
-                        df[col] = pd.to_numeric(df[col], errors="ignore")
+            df = _coerce_chunk(df)
             df.to_parquet(path, index=False, engine="pyarrow", compression="snappy")
             log.info(f"Saved -> {path}  ({len(df)} rows x {len(df.columns)} cols)")
 
@@ -202,13 +251,17 @@ implementation:
                 s3.download_file(bucket, object_key, tmp_path)
                 raw_size = os.path.getsize(tmp_path)
                 log.info(f"Downloaded {raw_size/1e6:.1f} MB in {time.time()-t0:.1f}s")
-                df = _read_raw(tmp_path, minio_filename)
+                if minio_filename.endswith(".json"):
+                    total_rows, columns = _stream_ndjson_to_parquet(tmp_path, output_path)
+                else:
+                    df = pd.read_csv(tmp_path, low_memory=False)
+                    _save_parquet(df, output_path)
+                    total_rows, columns = len(df), list(df.columns)
             finally:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
-            _save_parquet(df, output_path)
             meta = {"source": "bis", "filename": minio_filename,
-                    "rows": len(df), "columns": list(df.columns), "output_path": output_path}
+                    "rows": total_rows, "columns": columns, "output_path": output_path}
             if meta_path:
                 os.makedirs(os.path.dirname(meta_path) or ".", exist_ok=True)
                 with open(meta_path, "w") as f:
@@ -234,7 +287,7 @@ implementation:
                         })
             return pd.DataFrame(rows)
 
-        # -- Synthetic data generation --------------------------------------------------
+        # -- Main -----------------------------------------------------------------------
 
         def main():
             ap = argparse.ArgumentParser(description="Source component: BIS")
