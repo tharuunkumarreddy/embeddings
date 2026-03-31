@@ -1,4 +1,4 @@
-name: Source_WITS_V3
+name: Source_WITS_new_V3
 description: Fetched WITS data
 inputs:
   - {name: mode, type: String, optional: false, default: 'minio'}
