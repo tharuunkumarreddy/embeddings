@@ -1,4 +1,4 @@
-name: Source_ILOSTAT_V3
+name: Source_ILOSTAT_new_V3
 description: Fetches ILOSTAT labour-market data (employment, wages, labour force participation)
 inputs:
   - {name: mode, type: String, optional: false, default: 'minio'}
