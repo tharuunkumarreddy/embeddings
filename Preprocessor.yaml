@@ -1,18 +1,18 @@
 name: Preprocessor
 description: Harmonise all 12 raw source Parquets into a single bundle.pkl and manifest.json.
 inputs:
-  - {name: worldbank_path, type: Object, optional: false}
-  - {name: imf_forecasts_path, type: Object, optional: false}
-  - {name: imf_timeseries_path, type: Object, optional: false}
-  - {name: gdelt_path, type: Object, optional: false}
-  - {name: oecd_path, type: Object, optional: false}
-  - {name: wits_path, type: Object, optional: false}
-  - {name: bis_path, type: Object, optional: false}
-  - {name: ilostat_path, type: Object, optional: false}
-  - {name: sec_path, type: Object, optional: false}
-  - {name: comtrade_path, type: Object, optional: false}
-  - {name: unido_path, type: Object, optional: false}
-  - {name: unctad_path, type: Object, optional: false}
+  - {name: worldbank_path, type: Object, optional: true}
+  - {name: imf_forecasts_path, type: Object, optional: true}
+  - {name: imf_timeseries_path, type: Object, optional: true}
+  - {name: gdelt_path, type: Object, optional: true}
+  - {name: oecd_path, type: Object, optional: true}
+  - {name: wits_path, type: Object, optional: true}
+  - {name: bis_path, type: Object, optional: true}
+  - {name: ilostat_path, type: Object, optional: true}
+  - {name: sec_path, type: Object, optional: true}
+  - {name: comtrade_path, type: Object, optional: true}
+  - {name: unido_path, type: Object, optional: true}
+  - {name: unctad_path, type: Object, optional: true}
   - {name: countries, type: String, optional: false}
   - {name: year_start, type: String, optional: false, default: '2010'}
   - {name: year_end, type: String, optional: false, default: '2025'}
