@@ -1,4 +1,4 @@
-name: Source_UN_Comtrade_V3
+name: Source_UN_Comtrade_new_V3
 description: Fetches UN Comtrade
 inputs:
   - {name: mode, type: String, optional: false, default: 'minio'}
