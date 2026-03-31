@@ -2,7 +2,7 @@ name: C_m Loader - Country-Market Crosswalk
 description: Load ISIC sector crosswalk CSV to produce c_m_bundle.parquet containing sector weights, gates, and ISIC codes per country/year for regime gating.
 inputs:
   - name: isic_csv
-    type: Data
+    type: Object
     description: 'Path to playbook_a_isic_full_v2.csv (ISIC crosswalk)'
   - name: countries
     type: String
@@ -55,6 +55,18 @@ implementation:
             "aggregate_activity", "dominant_isic_section", "dominant_sector_share_pct",
         ]
 
+        def resolve_artifact_path(path: str) -> str:
+            # KFP/Argo mounts inputPath artifacts as a directory.
+            # If the given path is a directory, walk it and return the first file found.
+            if os.path.isdir(path):
+                for root, dirs, files in os.walk(path):
+                    for fname in sorted(files):  # sorted for determinism
+                        resolved = os.path.join(root, fname)
+                        log.info(f"Resolved artifact dir -> file: {resolved}")
+                        return resolved
+                raise FileNotFoundError(f"No file found inside artifact directory: {path}")
+            return path  # already a plain file path
+
         def load_c_m(
             isic_csv: str,
             countries: list,
@@ -62,6 +74,9 @@ implementation:
             year_end: int,
             isic_level: str = "",
         ) -> pd.DataFrame:
+            # Resolve directory-mounted artifact to actual file
+            isic_csv = resolve_artifact_path(isic_csv)
+
             log.info(f"Reading ISIC CSV: {isic_csv}")
             df = pd.read_csv(isic_csv, low_memory=False)
             log.info(f"Total rows: {len(df):,}")
