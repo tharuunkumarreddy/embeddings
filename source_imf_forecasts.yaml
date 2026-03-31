@@ -1,4 +1,4 @@
-name: Source_IMF_Forecasts_V3
+name: Source_IMF_Forecasts_new_V3
 description: Fetches IMF Forecast data (Article IV, WEO static).
 inputs:
   - {name: mode, type: String, optional: false, default: 'minio'}
