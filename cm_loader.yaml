@@ -2,7 +2,7 @@ name: C_m Loader - Country-Market Crosswalk
 description: Load ISIC sector crosswalk CSV to produce c_m_bundle.parquet containing sector weights, gates, and ISIC codes per country/year for regime gating.
 inputs:
   - name: isic_csv
-    type: Object
+    type: Data
     description: 'Path to playbook_a_isic_full_v2.csv (ISIC crosswalk)'
   - name: countries
     type: String
@@ -56,8 +56,8 @@ implementation:
         ]
 
         def resolve_artifact_path(path: str) -> str:
-            # KFP/Argo mounts inputPath artifacts as a directory.
-            # If the given path is a directory, walk it and return the first file found.
+            #KFP/Argo mounts inputPath artifacts as a directory.
+            #If the given path is a directory, walk it and return the first file found.
             if os.path.isdir(path):
                 for root, dirs, files in os.walk(path):
                     for fname in sorted(files):  # sorted for determinism
