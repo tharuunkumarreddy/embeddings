@@ -1,4 +1,4 @@
-name: Source_BIS_V3
+name: Source_BIS_new_V3
 description: Fetches BIS data
 inputs:
   - {name: mode, type: String, optional: false, default: 'minio'}
