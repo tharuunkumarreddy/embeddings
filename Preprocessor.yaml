@@ -88,10 +88,6 @@ implementation:
         # ---------------------------------------------------------------------------
         
         def resolve_artifact_path(path: str) -> str:
-            #KFP/Argo mounts Data inputPath artifacts as a directory.
-            #/tmp/inputs/<name>/data  -- 'data' is the actual file.
-            #If path is a directory, walk it and return the first file found.
-            #Returns the original path unchanged if it is already a plain file.
             if not path:
                 return path
             if os.path.isdir(path):
@@ -129,7 +125,6 @@ implementation:
             return result
         
         def project_to_market(df, markets, iso3_col, year_col=None):
-            #Align DataFrame rows to the markets list; returns a single-row-per-market DataFrame.#
             if iso3_col not in df.columns:
                 return pd.DataFrame(index=range(len(markets)))
             latest = (
@@ -141,7 +136,6 @@ implementation:
             return ref.merge(latest, on=iso3_col, how="left")
         
         def build_ts(df, value_col, year_col, markets, iso3_col, T_STEPS):
-            #Build (N, T) time-series array from long DataFrame.#
             N = len(markets)
             result = np.zeros((N, T_STEPS), dtype=np.float32)
             if df.empty or value_col not in df.columns:
@@ -158,7 +152,6 @@ implementation:
             return result
         
         def detect_countries_from_parquets(paths):
-            #Auto-detect ISO3 country list from all available parquet files.#
             iso_candidates = ["iso3", "country_code", "reporter", "reporteriso3"]
             found = set()
             for key, p in paths.items():
@@ -183,7 +176,6 @@ implementation:
         # ---------------------------------------------------------------------------
         
         def extract_worldbank(df, markets, T_STEPS):
-            #Returns WGI(N,6), WDI(N,7), B_READY(N,5).#
             iso_col  = next((c for c in ["iso3", "country_code"] if c in df.columns), None)
             year_col = next((c for c in ["year"] if c in df.columns), None)
             aligned  = project_to_market(df, markets, iso_col or "iso3", year_col)
@@ -218,7 +210,6 @@ implementation:
             return {"WGI": wgi, "WDI": wdi, "B_READY": b_ready}
         
         def extract_imf(df_fc, df_ts, markets, T_STEPS):
-            #Returns IMF_ArtIV(N,8), WEO(N,6), IMF_FSAP(N,4), IMF_GFSR(N,4).#
             result = {}
             if not df_fc.empty:
                 iso_col = next((c for c in ["iso3", "country_code", "ISO3"] if c in df_fc.columns), None)
@@ -261,7 +252,6 @@ implementation:
             return result
         
         def extract_gdelt(df, markets, T_STEPS):
-            #Returns GDELT_govt(N,6), GDELT_density(N,3), GDELT_media_ts(N,T), GDELT_spikes_ts(N,T).#
             iso_col  = next((c for c in ["iso3", "reporter", "reporteriso3", "country_code"] if c in df.columns), None)
             year_col = next((c for c in ["year", "period"] if c in df.columns), None)
             aligned  = project_to_market(df, markets, iso_col or "iso3", year_col)
@@ -290,7 +280,6 @@ implementation:
             }
         
         def extract_oecd(df, markets, T_STEPS, oecd_mask):
-            #Returns OECD_GOV(N,4), OECD_Digital(N,4), OECD_corpgov(N,3).#
             iso_col = next((c for c in ["iso3", "country_code", "COU", "LOCATION"] if c in df.columns), None)
             aligned = project_to_market(df, markets, iso_col or "iso3")
         
@@ -317,7 +306,6 @@ implementation:
             return {"OECD_GOV": oecd_gov, "OECD_Digital": oecd_digital, "OECD_corpgov": oecd_corpgov}
         
         def extract_wits(df, markets, T_STEPS):
-            #Returns WITS_policy(N,4), WITS_NTM(N,3).#
             iso_col = next((c for c in ["iso3", "reporter", "reporteriso3", "country_code"] if c in df.columns), None)
             aligned = project_to_market(df, markets, iso_col or "iso3")
         
@@ -337,7 +325,6 @@ implementation:
             return {"WITS_policy": wits_policy, "WITS_NTM": wits_ntm}
         
         def extract_bis(df, markets, T_STEPS, bis_mask):
-            #Returns BIS_credit(N,4), BIS_capital(N,3), BIS_credit_ts(N,T).#
             iso_col  = next((c for c in ["iso3", "country_final", "reporter", "country_code"] if c in df.columns), None)
             year_col = next((c for c in ["year", "date", "period"] if c in df.columns), None)
             aligned  = project_to_market(df, markets, iso_col or "iso3", year_col)
@@ -360,7 +347,6 @@ implementation:
             return {"BIS_credit": bis_credit, "BIS_capital": bis_capital, "BIS_credit_ts": bis_credit_ts}
         
         def extract_ilostat(df, markets, T_STEPS):
-            #Returns ILOSTAT(N,5), ILOSTAT_wages(N,3).#
             iso_col = next((c for c in ["iso3", "country_code", "ref_area"] if c in df.columns), None)
             aligned = project_to_market(df, markets, iso_col or "iso3")
         
@@ -381,7 +367,6 @@ implementation:
             return {"ILOSTAT": ilostat, "ILOSTAT_wages": ilostat_wages}
         
         def extract_sec(df, markets, T_STEPS, sec_mask):
-            #Returns SEC(N,4), SEC_rent(N,3), SEC_8K_ts(N,T).#
             iso_col  = next((c for c in ["iso3", "country_code"] if c in df.columns), None)
             year_col = next((c for c in ["year", "filing_year"] if c in df.columns), None)
             aligned  = project_to_market(df, markets, iso_col or "iso3", year_col)
@@ -404,7 +389,6 @@ implementation:
             return {"SEC": sec, "SEC_rent": sec_rent, "SEC_8K_ts": sec_8k_ts}
         
         def extract_comtrade(df, markets, T_STEPS):
-            #Returns Comtrade adjacency(N,N) + node_features(N,4), UNCTAD_FDI(N,4), UNCTAD_PCI(N,3).#
             N = len(markets)
             market_idx = {m: i for i, m in enumerate(markets)}
         
@@ -451,7 +435,6 @@ implementation:
             return {"Comtrade": {"adjacency": adj, "node_features": node_feats}, "UNCTAD_FDI": unctad_fdi, "UNCTAD_PCI": unctad_pci}
         
         def extract_unido(df, markets, T_STEPS):
-            #Returns UNIDO_MVA(N,4), UNIDO_coord(N,3), UNIDO_CIP(N,4), UNIDO_IPI(N,T).#
             iso_col = next((c for c in ["iso3", "country_code", "ccode", "country_iso", "reporter"] if c in df.columns), None)
             yr_col  = next((c for c in ["year", "period", "time"] if c in df.columns), None)
             aligned = project_to_market(df, markets, iso_col or "iso3", yr_col)
@@ -478,7 +461,6 @@ implementation:
             }
         
         def extract_unctad(df, markets, T_STEPS):
-            #Returns UNCTAD_FDI(N,4), UNCTAD_PCI(N,3) from dedicated UNCTAD file.#
             iso_col = next((c for c in ["iso3", "country_code", "reporter"] if c in df.columns), None)
             aligned = project_to_market(df, markets, iso_col or "iso3")
         
@@ -542,7 +524,6 @@ implementation:
             ap.add_argument("--output_manifest",     required=True)
             args = ap.parse_args()
         
-            # Resolve all artifact directory paths to actual files
             raw_paths = {
                 "worldbank":      args.worldbank_path,
                 "imf_forecasts":  args.imf_forecasts_path,
@@ -610,13 +591,11 @@ implementation:
         
             data_dict = fill_missing(data_dict, markets, T_STEPS)
         
-            # Save bundle
             os.makedirs(os.path.dirname(args.output_bundle) or ".", exist_ok=True)
             with open(args.output_bundle, "wb") as f:
                 pickle.dump(data_dict, f)
             log.info(f"Bundle saved -> {args.output_bundle}  ({len(data_dict)} keys)")
         
-            # Save manifest
             def _describe(v):
                 if hasattr(v, "shape"):        return list(v.shape)
                 elif isinstance(v, dict):      return {kk: list(vv.shape) if hasattr(vv, "shape") else str(type(vv)) for kk, vv in v.items()}
