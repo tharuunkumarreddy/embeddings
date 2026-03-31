@@ -1,4 +1,4 @@
-name: Source_UNCTAD_V3
+name: Source_UNCTAD_new_V3
 description: Fetches UNCTAD data
 inputs:
   - {name: mode, type: String, optional: false, default: 'minio'}
