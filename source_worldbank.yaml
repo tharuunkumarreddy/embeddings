@@ -1,4 +1,4 @@
-name: Source_World_Bank_V3
+name: Source_World_Bank_new_V3
 description: Fetches World Bank data
 inputs:
   - {name: mode, type: String, optional: false, default: 'minio'}
