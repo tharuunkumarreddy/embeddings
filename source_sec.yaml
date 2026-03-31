@@ -1,4 +1,4 @@
-name: Source_SEC_V3
+name: Source_SEC_new_V3
 description: Fetches SEC compliance, enforcement, and market-concentration data
 inputs:
   - {name: mode, type: String, optional: false, default: 'minio'}
