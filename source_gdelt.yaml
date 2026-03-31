@@ -1,70 +1,22 @@
-name: Source - GDELT
-description: >
-  Independent Elyra/Kubeflow component. Three modes:
-  1. minio     : downloads gdelt_combined.csv from MinIO -> parquet
-  2. pi_api    : fetches all data from PI API endpoint   -> parquet
-  3. synthetic : generates synthetic GDELT monthly data  -> parquet
-
+name: Source_GDELT_V3
+description: fetched GDELT data
 inputs:
-  - name: mode
-    type: String
-    description: 'Data fetch mode: "minio", "pi_api", or "synthetic"'
-    default: 'minio'
-  - name: countries
-    type: String
-    description: 'Comma-separated ISO3 country codes. Empty = all available.'
-    default: ''
-  - name: year_start
-    type: String
-    description: 'Start year (inclusive)'
-  - name: year_end
-    type: String
-    description: 'End year (inclusive)'
-  - name: minio_endpoint
-    type: String
-    description: 'MinIO endpoint URL'
-    default: 'https://s3.us-west-004.backblazeb2.com'
-  - name: minio_access_key
-    type: String
-    description: 'MinIO access key'
-    default: ''
-  - name: minio_secret_key
-    type: String
-    description: 'MinIO secret key'
-    default: ''
-  - name: bucket
-    type: String
-    description: 'MinIO bucket name'
-    default: 'holacracydata'
-  - name: prefix
-    type: String
-    description: 'MinIO object prefix / sub-folder'
-    default: 'connector_output'
-  - name: minio_filename
-    type: String
-    description: 'Object filename inside the MinIO bucket/prefix (e.g. worldbank_final_output.json)'
-    default: 'gdelt_combined.csv'
-  - name: pi_api_url
-    type: String
-    description: 'PI API base URL'
-    default: ''
-  - name: pi_access_token
-    type: String
-    description: 'Bearer token for PI API'
-    default: ''
-  - name: pi_page_size
-    type: String
-    description: 'Records per page for PI API pagination'
-    default: '2000'
-
+  - {name: mode, type: String, optional: false, default: 'minio'}
+  - {name: countries, type: String, optional: false}
+  - {name: year_start, type: String, optional: false}
+  - {name: year_end, type: String, optional: false}
+  - {name: minio_endpoint, type: String, optional: false, default: 'https://s3.us-west-004.backblazeb2.com'}
+  - {name: minio_access_key, type: String, optional: false}
+  - {name: minio_secret_key, type: String, optional: false}
+  - {name: bucket, type: String, optional: false, default: 'holacracydata'}
+  - {name: prefix, type: String, optional: false, default: 'connector_output'}
+  - {name: minio_filename, type: String, optional: false, default: 'gdelt_combined.csv'}
+  - {name: pi_api_url, type: String, optional: false}
+  - {name: pi_access_token, type: String, optional: false}
+  - {name: pi_page_size, type: String, optional: false, default: '2000'}
 outputs:
-  - name: output_data
-    type: Data
-    description: 'Source data in Parquet format'
-  - name: meta
-    type: Data
-    description: 'Fetch metadata JSON'
-
+  - {name: data, type: Object}
+  - {name: meta, type: Object}
 implementation:
   container:
     image: nikhilv215/nesy-factory:v23
@@ -80,18 +32,16 @@ implementation:
         import os, json, argparse, logging, time
         import numpy as np
         import pandas as pd
-
+        
         logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
         log = logging.getLogger("source_gdelt")
-
+        
         DEFAULT_SYNTHETIC_COUNTRIES = [
             "USA","GBR","DEU","FRA","JPN","CHN","IND","BRA","CAN","AUS",
             "KOR","MEX","IDN","TUR","SAU","ZAF","ARG","NGA","EGY","PAK",
             "NLD","CHE","SWE","NOR","POL","THA","MYS","PHL","VNM","BGD",
         ]
-
-        # -- Helpers --------------------------------------------------------------------
-
+        
         def _make_s3_client(endpoint, access_key, secret_key):
             import boto3
             from botocore.config import Config as BotoConfig
@@ -101,7 +51,7 @@ implementation:
                 config=BotoConfig(signature_version="s3v4",
                                   retries={"max_attempts": 5, "mode": "adaptive"}),
             )
-
+        
         def _read_raw(local_path: str, filename: str) -> pd.DataFrame:
             if filename.endswith(".json"):
                 with open(local_path, "r", encoding="utf-8") as f:
@@ -117,7 +67,7 @@ implementation:
             elif filename.endswith(".csv"):
                 return pd.read_csv(local_path, low_memory=False)
             raise ValueError(f"Unsupported format: {filename}")
-
+        
         def _save_parquet(df: pd.DataFrame, path: str):
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             for col in df.columns:
@@ -128,21 +78,17 @@ implementation:
                             lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
             df.to_parquet(path, index=False, engine="pyarrow", compression="snappy")
             log.info(f"Saved -> {path}  ({len(df)} rows x {len(df.columns)} cols)")
-
-        # -- PI API ---------------------------------------------------------------------
-
+        
         def fetch_from_pi_api(api_url: str, access_token: str, page_size: int = 2000) -> pd.DataFrame:
             import requests
             from requests.adapters import HTTPAdapter
             from urllib3.util.retry import Retry
-
             PI_MAX = 2000
             page_size = min(page_size, PI_MAX)
             session = requests.Session()
             retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
             session.mount("https://", HTTPAdapter(max_retries=retries))
             session.mount("http://", HTTPAdapter(max_retries=retries))
-
             headers = {}
             if access_token:
                 token = access_token
@@ -150,7 +96,6 @@ implementation:
                     with open(access_token) as f:
                         token = f.read().strip()
                 headers["Authorization"] = f"Bearer {token}"
-
             all_records, page = [], 1
             while True:
                 resp = session.get(api_url, headers=headers,
@@ -165,13 +110,10 @@ implementation:
                     break
                 page += 1
                 log.info(f"  PI API page {page}  total_so_far={len(all_records)}")
-
             if not all_records:
                 return pd.DataFrame()
             return pd.json_normalize(all_records)
-
-        # -- MinIO download -------------------------------------------------------------
-
+        
         def download_from_minio(endpoint, access_key, secret_key, bucket, prefix,
                                 minio_filename, output_path, meta_path="") -> dict:
             import tempfile
@@ -198,11 +140,8 @@ implementation:
                 with open(meta_path, "w") as f:
                     json.dump(meta, f, indent=2)
             return meta
-
-        # -- Synthetic data generation --------------------------------------------------
-
+        
         def generate_synthetic(countries: list, year_start: int, year_end: int) -> pd.DataFrame:
-            
             rows = []
             for iso in countries:
                 for yr in range(year_start, year_end + 1):
@@ -223,9 +162,7 @@ implementation:
                             "violence_count":           int(np.random.randint(0, 100)),
                         })
             return pd.DataFrame(rows)
-
-        # -- Main -----------------------------------------------------------------------
-
+        
         def main():
             ap = argparse.ArgumentParser(description="Source component: GDELT")
             ap.add_argument("--mode",             choices=["minio", "pi_api", "synthetic"], default="minio")
@@ -244,12 +181,10 @@ implementation:
             ap.add_argument("--pi_page_size",     type=int, default=2000)
             ap.add_argument("--meta_path",        default="")
             args = ap.parse_args()
-
             log.info("=" * 60)
             log.info("  SOURCE: GDELT")
             log.info(f"  mode={args.mode}")
             log.info("=" * 60)
-
             if args.mode == "synthetic":
                 countries = [c.strip() for c in args.countries.split(",")] if args.countries else DEFAULT_SYNTHETIC_COUNTRIES
                 df = generate_synthetic(countries, args.year_start, args.year_end)
@@ -263,12 +198,12 @@ implementation:
                     os.makedirs(os.path.dirname(args.meta_path) or ".", exist_ok=True)
                     with open(args.meta_path, "w") as f:
                         json.dump(meta, f, indent=2)
-            else:  # minio
+            else:
                 download_from_minio(
                     args.minio_endpoint, args.minio_access_key, args.minio_secret_key,
                     args.bucket, args.prefix, args.minio_filename, args.output_path, args.meta_path,
                 )
-
+        
         if __name__ == "__main__":
             main()
     args:
@@ -299,6 +234,6 @@ implementation:
       - --pi_page_size
       - {inputValue: pi_page_size}
       - --output_path
-      - {outputPath: output_data}
+      - {outputPath: data}
       - --meta_path
       - {outputPath: meta}
