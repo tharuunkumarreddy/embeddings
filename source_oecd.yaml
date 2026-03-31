@@ -1,4 +1,4 @@
-name: Source_OECD_V3
+name: Source_OECD_new_V3
 description: Fetches OECD data (governance, PMR, digital, corporate governance)
 inputs:
   - {name: mode, type: String, optional: false, default: 'minio'}
