@@ -2,7 +2,7 @@ name: C_m Loader - Country-Market Crosswalk
 description: Load ISIC sector crosswalk CSV to produce c_m_bundle.parquet containing sector weights, gates, and ISIC codes per country/year for regime gating.
 inputs:
   - name: isic_csv
-    type: String
+    type: Data
     description: 'Path to playbook_a_isic_full_v2.csv (ISIC crosswalk)'
   - name: countries
     type: String
@@ -141,7 +141,7 @@ implementation:
             main()
     args:
       - --isic_csv
-      - {inputValue: isic_csv}
+      - {inputPath: isic_csv}
       - --countries
       - {inputValue: countries}
       - --year_start
