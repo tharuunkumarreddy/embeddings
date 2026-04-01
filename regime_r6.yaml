@@ -1,17 +1,18 @@
-name: Regime R6 - Operational Reality
-description: SVD-initialised factor model on ILOSTAT / UNIDO-IPI / GDELT. embed_dim=32. REGIME_DIMS: [160, 192].
+name: Regime R6 - Operational Reality new
+description: 'SVD-initialised factor model on ILOSTAT / UNIDO-IPI / GDELT. embed_dim=32. REGIME_DIMS [160, 192].'
+
 inputs:
   - name: regime_id
     type: String
     description: 'Regime identifier (r1..r9) used in metadata output'
     default: 'r6'
   - name: bundle
-    type: String
+    type: Object
     description: 'Path to bundle.pkl from Preprocessor component'
   - name: c_m_path
-    type: String
+    type: Object
     description: 'Path to c_m_bundle.parquet from C_m Loader (empty = no gating)'
-    default: ''
+    optional: true
   - name: countries
     type: String
     description: 'Comma-separated ISO3 country codes. Empty = auto-detect from bundle.'
@@ -27,10 +28,10 @@ inputs:
 
 outputs:
   - name: embeddings
-    type: Data
+    type: Object
     description: 'Regime embeddings Parquet (country | year | isic_code | isic_level | dim_0..dim_31)'
   - name: meta
-    type: Data
+    type: Object
     description: 'Regime metadata JSON'
 
 implementation:
@@ -50,7 +51,17 @@ implementation:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
         log = logging.getLogger("regime_r6")
 
-        # -- Inline BaseRegimeModel ----------------------------------------------------
+        def resolve_artifact_path(path: str) -> str:
+            if not path:
+                return path
+            if os.path.isdir(path):
+                for root, dirs, files in os.walk(path):
+                    for fname in sorted(files):
+                        resolved = os.path.join(root, fname)
+                        log.info(f"Resolved artifact dir -> file: {resolved}")
+                        return resolved
+                raise FileNotFoundError(f"No file found inside artifact directory: {path}")
+            return path
 
         class BaseRegimeModel(abc.ABC):
             @property
@@ -63,11 +74,9 @@ implementation:
             def fit(self, data_dict: dict) -> None: ...
             @abc.abstractmethod
             def embed(self, data_dict: dict) -> torch.Tensor: ...
-
             @staticmethod
             def to_tensor(arr):
                 return torch.from_numpy(np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)).float()
-
             @staticmethod
             def guard_output(t, name):
                 if torch.isnan(t).any() or torch.isinf(t).any():
@@ -75,34 +84,55 @@ implementation:
                     t = torch.nan_to_num(t, nan=0.0, posinf=1.0, neginf=0.0)
                 return t
 
-        # -- R6 Model: SVD-initialised Factor Model ------------------------------------
-
         EMBED_DIM  = 32
         N_FACTORS  = 8
         HIDDEN_DIM = 48
         N_EPOCHS   = 200
         LR         = 1e-3
-
-        SRC_KEYS = ["ILOSTAT", "UNIDO_IPI", "GDELT_density"]
-        SRC_DIMS = {"ILOSTAT": 5, "UNIDO_IPI": 3, "GDELT_density": 3}
-        TOTAL_DIM = sum(SRC_DIMS.values())   # 11
+        # ILOSTAT(5) + IPI_collapsed(3) + GDELT_density(3) = 11
+        TOTAL_DIM = 11
 
         class OperationalFactorModel(nn.Module):
-    Regime 6 - Operational Reality | embed_dim=32 | REGIME_DIMS: operational [160,192]
+            # Regime 6 - Operational Reality, embed_dim=32, operational [160,192]
+            def __init__(self, in_dim, n_factors, hidden, embed_dim):
+                super().__init__()
+                self.market_factors = nn.Parameter(torch.randn(1, n_factors) * 0.01)
+                self.item_factors   = nn.Parameter(torch.randn(in_dim, n_factors) * 0.01)
+                self.projector = nn.Sequential(
+                    nn.Linear(n_factors, hidden), nn.GELU(),
+                    nn.Linear(hidden, embed_dim), nn.Tanh(),
+                )
+                self.decoder = nn.Sequential(
+                    nn.Linear(n_factors, hidden), nn.GELU(),
+                    nn.Linear(hidden, in_dim), nn.Sigmoid(),
+                )
+            def svd_init(self, x_np):
+                U, S, Vt = np.linalg.svd(x_np, full_matrices=False)
+                k = min(self.market_factors.shape[1], U.shape[1])
+                with torch.no_grad():
+                    self.market_factors.data = torch.from_numpy(
+                        (U[:, :k] * S[:k]).astype(np.float32)
+                    )
+                    self.item_factors.data = torch.from_numpy(
+                        Vt[:k, :].T.astype(np.float32)
+                    )
+            def forward(self, x):
+                factors = x @ self.item_factors
+                emb   = self.projector(factors)
+                recon = self.decoder(factors)
+                return emb, factors, recon
 
+        class OperationalRealityRegime(BaseRegimeModel):
             @property
             def regime_name(self): return "Operational Reality"
             @property
             def embed_dim(self): return EMBED_DIM
-
             def __init__(self):
                 self.model = None
-
             def _stack(self, data_dict):
-                ilostat      = data_dict["ILOSTAT"]      # (N, 5)
-                unido_ipi_ts = data_dict["UNIDO_IPI"]    # (N, T)
-                gdelt_den    = data_dict["GDELT_density"] # (N, 3)
-
+                ilostat      = data_dict["ILOSTAT"]
+                unido_ipi_ts = data_dict["UNIDO_IPI"]
+                gdelt_den    = data_dict["GDELT_density"]
                 ipi_mean  = unido_ipi_ts.mean(axis=1, keepdims=True)
                 ipi_std   = unido_ipi_ts.std(axis=1, keepdims=True) + 1e-6
                 T = unido_ipi_ts.shape[1]
@@ -112,10 +142,8 @@ implementation:
                     for i in range(unido_ipi_ts.shape[0])
                 ], dtype=np.float32).reshape(-1, 1)
                 ipi_collapsed = np.concatenate([ipi_mean, ipi_std, ipi_trend], axis=1)
-
                 concat_np = np.concatenate([ilostat, ipi_collapsed, gdelt_den], axis=1).astype(np.float32)
                 return torch.from_numpy(concat_np), concat_np
-
             def fit(self, data_dict):
                 x, x_np = self._stack(data_dict)
                 self.model = OperationalFactorModel(TOTAL_DIM, N_FACTORS, HIDDEN_DIM, EMBED_DIM)
@@ -134,7 +162,6 @@ implementation:
                     nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     opt.step()
                 self.model.eval()
-
             def embed(self, data_dict):
                 if self.model is None:
                     self.fit(data_dict)
@@ -142,8 +169,6 @@ implementation:
                 with torch.no_grad():
                     emb, _, _ = self.model(x)
                 return self.guard_output(emb, self.regime_name)
-
-        # -- Runner utilities (inlined) ------------------------------------------------
 
         def get_country_ids_from_bundle(data_dict):
             if "__countries__" in data_dict:
@@ -165,13 +190,21 @@ implementation:
             result.insert(1, "isic_level", c_m_df["isic_level"].values if "isic_level" in c_m_df.columns else "")
             return result
 
-        def run_for_bundle(data_dict, model, c_m_df, countries, years):
-            all_rows = []
+        def run_for_bundle(data_dict, model, c_m_df, countries, years, output_path):
+            import pyarrow as pa
+            import pyarrow.parquet as pq
             N = len(countries)
+            embed_dim = model.embed_dim
             log.info(f"  Fitting model: {model.regime_name}")
             model.fit(data_dict)
             base_np = model.embed(data_dict).detach().numpy()
             log.info(f"  Base embedding: {base_np.shape}")
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            writer = None
+            total_rows = 0
+            chunk_buf = []
+            FLUSH_EVERY = 20
+            dim_cols = [f"dim_{i}" for i in range(embed_dim)]
             for ci, country in enumerate(countries):
                 emb_c = base_np[[ci]]
                 c_m_c = c_m_df[c_m_df["country"] == country] if "country" in c_m_df.columns else c_m_df
@@ -179,26 +212,41 @@ implementation:
                     c_m_yr = (c_m_c[c_m_c["year"] == year]
                               if "year" in c_m_df.columns and not c_m_c.empty else c_m_c)
                     if c_m_yr.empty:
-                        all_rows.append({"country": country, "year": year,
-                                         "isic_code": "ALL", "isic_level": "ALL",
-                                         **{f"dim_{i}": float(emb_c[0, i])
-                                            for i in range(emb_c.shape[1])}})
+                        row = {"country": country, "year": year, "isic_code": "ALL", "isic_level": "ALL"}
+                        for i in range(embed_dim):
+                            row[dim_cols[i]] = float(emb_c[0, i])
+                        chunk_buf.append(row)
                         continue
                     gdf = apply_cm_gating(emb_c, c_m_yr)
                     if gdf.empty:
                         continue
                     gdf.insert(0, "year", year)
                     gdf.insert(0, "country", country)
-                    all_rows.extend(gdf.to_dict("records"))
-                if (ci + 1) % 20 == 0:
-                    log.info(f"  {ci+1}/{N} countries ...")
-            return pd.DataFrame(all_rows)
-
-        # -- Main ---------------------------------------------------------------------
+                    chunk_buf.extend(gdf.to_dict("records"))
+                if (ci + 1) % FLUSH_EVERY == 0 and chunk_buf:
+                    chunk_df = pd.DataFrame(chunk_buf)
+                    table = pa.Table.from_pandas(chunk_df, preserve_index=False)
+                    if writer is None:
+                        writer = pq.ParquetWriter(output_path, table.schema, compression="snappy")
+                    writer.write_table(table)
+                    total_rows += len(chunk_df)
+                    log.info(f"  {ci+1}/{N} countries ... flushed {total_rows} rows")
+                    chunk_buf = []
+            if chunk_buf:
+                chunk_df = pd.DataFrame(chunk_buf)
+                table = pa.Table.from_pandas(chunk_df, preserve_index=False)
+                if writer is None:
+                    writer = pq.ParquetWriter(output_path, table.schema, compression="snappy")
+                writer.write_table(table)
+                total_rows += len(chunk_df)
+            if writer:
+                writer.close()
+            log.info(f"  Streaming complete: {total_rows} total rows")
+            return total_rows
 
         def main():
             ap = argparse.ArgumentParser(description="Component: Regime Runner")
-            ap.add_argument("--regime_id",  default="r6", help="Regime identifier")
+            ap.add_argument("--regime_id",  default="r6")
             ap.add_argument("--bundle",     required=True)
             ap.add_argument("--c_m_path",   default="")
             ap.add_argument("--output",     required=True)
@@ -207,41 +255,34 @@ implementation:
             ap.add_argument("--year_start", type=int, default=2010)
             ap.add_argument("--year_end",   type=int, default=2025)
             args = ap.parse_args()
-
             log.info("=" * 60)
             log.info(f"  Regime Runner  |  regime={args.regime_id}  (Operational Reality)")
             log.info("=" * 60)
-
-            with open(args.bundle, "rb") as f:
+            bundle_path = resolve_artifact_path(args.bundle)
+            with open(bundle_path, "rb") as f:
                 data_dict = pickle.load(f)
-
             countries = ([c.strip() for c in args.countries.split(",")]
                          if args.countries else get_country_ids_from_bundle(data_dict))
             years = list(range(args.year_start, args.year_end + 1))
-
             c_m_df = pd.DataFrame()
-            if args.c_m_path and os.path.exists(args.c_m_path):
-                c_m_df = pd.read_parquet(args.c_m_path)
-                log.info(f"C_m loaded: {c_m_df.shape}")
-
+            if args.c_m_path:
+                cm_resolved = resolve_artifact_path(args.c_m_path)
+                if cm_resolved and os.path.exists(cm_resolved):
+                    c_m_df = pd.read_parquet(cm_resolved)
+                    log.info(f"C_m loaded: {c_m_df.shape}")
             model = OperationalRealityRegime()
             log.info(f"Running {model.regime_name}  embed_dim={model.embed_dim}  "
                      f"N={len(countries)}  T={len(years)}")
-
             t0 = time.time()
-            result_df = run_for_bundle(data_dict, model, c_m_df, countries, years)
+            total_rows = run_for_bundle(data_dict, model, c_m_df, countries, years, args.output)
             elapsed = time.time() - t0
-
-            os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-            result_df.to_parquet(args.output, index=False, engine="pyarrow", compression="snappy")
-            log.info(f"Saved -> {args.output}  shape={result_df.shape}  ({elapsed:.1f}s)")
-
+            log.info(f"Saved -> {args.output}  rows={total_rows}  ({elapsed:.1f}s)")
             if args.meta_path:
                 os.makedirs(os.path.dirname(args.meta_path) or ".", exist_ok=True)
                 with open(args.meta_path, "w") as f:
                     json.dump({"regime_id": args.regime_id, "regime_name": model.regime_name,
                                "embed_dim": model.embed_dim, "regime_dims": [160, 192],
-                               "output_shape": list(result_df.shape),
+                               "output_rows": total_rows,
                                "runtime_s": round(elapsed, 2)}, f, indent=2)
 
         if __name__ == "__main__":
@@ -250,9 +291,9 @@ implementation:
       - --regime_id
       - {inputValue: regime_id}
       - --bundle
-      - {inputValue: bundle}
+      - {inputPath: bundle}
       - --c_m_path
-      - {inputValue: c_m_path}
+      - {inputPath: c_m_path}
       - --countries
       - {inputValue: countries}
       - --year_start
