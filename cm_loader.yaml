@@ -1,4 +1,4 @@
-name: C_m_Loader_V3
+name: C_m_Loader_new_V3
 description: Load ISIC sector crosswalk CSV to produce c_m_bundle.parquet containing sector weights, gates, and ISIC codes per country/year for regime gating.
 inputs:
   - {name: isic_csv, type: Object, optional: false}
