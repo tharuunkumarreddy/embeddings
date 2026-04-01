@@ -1,4 +1,4 @@
-name: Preprocessor
+name: Preprocessor_new
 description: Harmonise all 12 raw source Parquets into a single bundle.pkl and manifest.json.
 inputs:
   - {name: worldbank_path, type: Object, optional: true}
