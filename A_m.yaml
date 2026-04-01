@@ -1,0 +1,180 @@
+name: A_m - Agency Mapper
+description: 'Derive agency/institutional capacity embeddings (A_m) from the preprocessed bundle.'
+
+inputs:
+  - name: bundle
+    type: Object
+    description: 'Path to bundle.pkl from Preprocessor'
+  - name: countries
+    type: String
+    description: 'Comma-separated ISO3 country codes'
+    default: ''
+  - name: year_start
+    type: String
+    description: 'Start year (inclusive)'
+    default: '2010'
+  - name: year_end
+    type: String
+    description: 'End year (inclusive)'
+    default: '2025'
+
+outputs:
+  - name: a_m_data
+    type: Object
+    description: 'Agency embeddings Parquet (country | year | agency_0..agency_2)'
+
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:v23
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import os, argparse, logging, pickle
+        import numpy as np
+        import pandas as pd
+        import torch
+
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+        log = logging.getLogger("a_m")
+
+        def resolve_artifact_path(path: str) -> str:
+            if not path:
+                return path
+            if os.path.isdir(path):
+                for root, dirs, files in os.walk(path):
+                    for fname in sorted(files):
+                        resolved = os.path.join(root, fname)
+                        log.info(f"Resolved artifact dir -> file: {resolved}")
+                        return resolved
+                raise FileNotFoundError(f"No file found inside artifact directory: {path}")
+            return path
+
+        def pareto_tail_exponent(shares: np.ndarray) -> float:
+            # Hill estimator for concentration: higher = more concentrated
+            shares = np.sort(shares[shares > 0])[::-1]
+            k = max(1, len(shares) // 2)
+            if len(shares) == 0 or shares[0] <= 0 or k == 0:
+                return 0.5
+            x_min = shares[k - 1]
+            if x_min <= 0:
+                return 0.5
+            hill_alpha = k / (np.log(shares[:k]) - np.log(x_min + 1e-12)).sum()
+            hill_alpha = max(0.1, hill_alpha)
+            return float(np.clip(1.0 / hill_alpha, 0.0, 1.0))
+
+        def gini_coefficient(values: np.ndarray) -> float:
+            # Gini coefficient from array of values
+            v = np.sort(np.abs(values.flatten()))
+            n = len(v)
+            if n == 0 or v.sum() == 0:
+                return 0.5
+            idx = np.arange(1, n + 1)
+            return float(np.clip((2.0 * (idx * v).sum() / (n * v.sum())) - (n + 1) / n, 0.0, 1.0))
+
+        def betweenness_centrality(adj: np.ndarray) -> np.ndarray:
+            # Approximate betweenness centrality via degree centrality (fast proxy)
+            N = adj.shape[0]
+            degree = (adj > 0).sum(axis=1).astype(np.float32)
+            max_deg = degree.max() + 1e-8
+            return np.clip(degree / max_deg, 0.0, 1.0).astype(np.float32)
+
+        def capture_likelihood(state_involvement: np.ndarray, rent_signal: np.ndarray) -> np.ndarray:
+            # gamma_m = sigmoid(state_involvement * rent_signal) in [0,1]
+            product = state_involvement * rent_signal
+            return (1.0 / (1.0 + np.exp(-product * 5 + 2.5))).astype(np.float32)
+
+        class AgencyEstimator:
+            # Computes alpha_m (concentration), beta_m (chokepoints), gamma_m (capture)
+            def compute(self, data_dict):
+                comtrade    = data_dict["Comtrade"]
+                adj         = comtrade["adjacency"]
+                node_feats  = comtrade["node_features"]   # (N, 4); col 0 = export_hhi
+                unido_coord = data_dict["UNIDO_coord"]    # (N, 3); col 2 = firm_density
+                oecd_gov    = data_dict["OECD_GOV"]       # (N, 4); col 2 = state involvement proxy
+                sec         = data_dict["SEC"]            # (N, 4); col 0 = compliance/rent
+                N = adj.shape[0]
+                # alpha_m: concentration
+                alpha_m = np.zeros(N, dtype=np.float32)
+                for n in range(N):
+                    hhi  = float(node_feats[n, 0])
+                    gini = gini_coefficient(unido_coord[:, 2])
+                    alpha_m[n] = np.clip(0.6 * hhi + 0.4 * gini, 0.0, 1.0)
+                # beta_m: chokepoints
+                beta_m = betweenness_centrality(adj)
+                # gamma_m: regulatory capture
+                state_inv  = oecd_gov[:, 2].astype(np.float32) if oecd_gov.shape[1] > 2 else np.zeros(N, dtype=np.float32)
+                rent_sig   = sec[:, 0].astype(np.float32) if sec.shape[1] > 0 else np.zeros(N, dtype=np.float32)
+                gamma_m = capture_likelihood(state_inv, rent_sig)
+                A_m = np.stack([alpha_m, beta_m, gamma_m], axis=1)
+                return torch.from_numpy(A_m)
+
+        def get_country_ids_from_bundle(data_dict):
+            if "__countries__" in data_dict:
+                return data_dict["__countries__"]
+            for val in data_dict.values():
+                if isinstance(val, np.ndarray) and val.ndim >= 1:
+                    return [f"country_{i}" for i in range(val.shape[0])]
+            return []
+
+        def tensor_to_df(tensor, countries, col_prefix, years):
+            arr  = tensor.detach().numpy()
+            K    = arr.shape[1]
+            cols = [f"{col_prefix}_{i}" for i in range(K)]
+            rows = []
+            for ci, country in enumerate(countries):
+                for yr in years:
+                    row = {"country": country, "year": yr}
+                    row.update({cols[k]: float(arr[ci, k]) for k in range(K)})
+                    rows.append(row)
+            return pd.DataFrame(rows)
+
+        def main():
+            ap = argparse.ArgumentParser(description="Component: Supplementary A_m")
+            ap.add_argument("--bundle",     required=True)
+            ap.add_argument("--countries",  default="")
+            ap.add_argument("--year_start", type=int, default=2010)
+            ap.add_argument("--year_end",   type=int, default=2025)
+            ap.add_argument("--output",     required=True)
+            args = ap.parse_args()
+            log.info("=" * 60)
+            log.info("  Supplementary: A_m  (Agency Distribution)")
+            log.info("=" * 60)
+            bundle_path = resolve_artifact_path(args.bundle)
+            with open(bundle_path, "rb") as f:
+                data_dict = pickle.load(f)
+            log.info(f"Bundle loaded: {len(data_dict)} keys")
+            countries = ([c.strip() for c in args.countries.split(",")]
+                         if args.countries else get_country_ids_from_bundle(data_dict))
+            years = list(range(args.year_start, args.year_end + 1))
+            log.info(f"Countries ({len(countries)})  Years: {len(years)}")
+            estimator = AgencyEstimator()
+            try:
+                a_m_tensor = estimator.compute(data_dict)
+                log.info(f"A_m tensor: {tuple(a_m_tensor.shape)}")
+            except Exception as e:
+                log.warning(f"AgencyEstimator failed ({e}) - using zeros")
+                a_m_tensor = torch.zeros(len(countries), 3)
+            a_m_df = tensor_to_df(a_m_tensor, countries, col_prefix="agency", years=years)
+            os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+            a_m_df.to_parquet(args.output, index=False, engine="pyarrow", compression="snappy")
+            log.info(f"A_m saved -> {args.output}  shape={a_m_df.shape}")
+            for iso in countries[:5]:
+                row = a_m_df[a_m_df["country"] == iso].iloc[0]
+                log.info(f"  {iso}: alpha={row['agency_0']:.3f}  beta={row['agency_1']:.3f}  gamma={row['agency_2']:.3f}")
+            log.info("  A_m DONE")
+
+        if __name__ == "__main__":
+            main()
+    args:
+      - --bundle
+      - {inputPath: bundle}
+      - --countries
+      - {inputValue: countries}
+      - --year_start
+      - {inputValue: year_start}
+      - --year_end
+      - {inputValue: year_end}
+      - --output
+      - {outputPath: a_m_data}
