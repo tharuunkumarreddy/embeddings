@@ -1,0 +1,150 @@
+name: FIle_CDN_Uploader_new
+description: CDN UPloader
+inputs:
+  - {name: embedding, type: Object, optional: false}
+  - {name: bearer_token, type: String, optional: false}
+  - {name: domain, type: String, optional: false}
+  - {name: get_cdn, type: String, optional: false}
+outputs:
+  - {name: embedding_cdn, type: String}
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:vtest4
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, subprocess, json, os, tempfile, shutil, sys, traceback, uuid
+        
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--embedding',     type=str, required=True)
+        parser.add_argument('--bearer_token',  type=str, required=True)
+        parser.add_argument('--domain',        type=str, required=True)
+        parser.add_argument('--get_cdn',       type=str, required=True)
+        parser.add_argument('--embedding_cdn', type=str, required=True)
+        args = parser.parse_args()
+        
+        def ensure_parent_dir(path):
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+        
+        def atomic_write(path, text):
+            ensure_parent_dir(path)
+            fd, tmp = tempfile.mkstemp(prefix="tmp_cdn_")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(text)
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                raise
+        
+        def encode_special_chars(text):
+            return (
+                text.replace("$", "%24")
+                    .replace("(", "%28")
+                    .replace(")", "%29")
+                    .replace("[", "%5B")
+                    .replace("]", "%5D")
+                    .replace("{", "%7B")
+                    .replace("}", "%7D")
+            )
+        
+        def find_file_in_dir(path):
+            print("[INFO] Resolving path: %s" % path)
+            # Argo may mount inputPath as a file directly (/tmp/inputs/name/data)
+            if os.path.isfile(path):
+                print("[INFO] Path is a file: %s" % path)
+                return path
+            # Otherwise walk the directory
+            print("[INFO] Scanning directory: %s" % path)
+            for root, dirs, files in os.walk(path):
+                files = [f for f in files if not f.endswith(".meta.json")]
+                if files:
+                    found = os.path.join(root, files[0])
+                    print("[INFO] Found file: %s" % found)
+                    return found
+            raise FileNotFoundError("No file found at path: %s" % path)
+        
+        def prepare_file(path):
+            if not os.path.exists(path):
+                raise FileNotFoundError(path)
+            if os.path.isfile(path):
+                name = os.path.basename(path)
+                safe = encode_special_chars(name)
+                if safe != name:
+                    tmp = os.path.join(tempfile.gettempdir(), safe)
+                    shutil.copy2(path, tmp)
+                    return tmp, tmp
+                return path, None
+            safe     = encode_special_chars(os.path.basename(path))
+            zip_path = os.path.join(tempfile.gettempdir(), "%s_%s.zip" % (safe, uuid.uuid4().hex))
+            shutil.make_archive(zip_path[:-4], "zip", path)
+            return zip_path, zip_path
+        
+        bearer_token = args.bearer_token.strip()
+        
+        upload_url = (
+            "%s/mobius-content-service/v1.0/content/upload"
+            "?filePathAccess=private&filePath=%%2Fbottle%%2Flimka%%2Fsoda%%2F"
+            % args.domain.rstrip("/")
+        )
+        
+        def run_upload(path):
+            cmd = [
+                "curl",
+                "--location", upload_url,
+                "--header", "Authorization: Bearer %s" % bearer_token,
+                "--form", "file=@%s" % path,
+                "--fail",
+                "--show-error"
+            ]
+            p = subprocess.run(cmd, capture_output=True)
+            if p.returncode != 0:
+                raise RuntimeError(p.stderr.decode())
+            return json.loads(p.stdout.decode())
+        
+        tmp_files = []
+        
+        try:
+            target_file     = find_file_in_dir(args.embedding)
+            prepared, tmp   = prepare_file(target_file)
+            if tmp:
+                tmp_files.append(tmp)
+        
+            resp = run_upload(prepared)
+            rel  = resp.get("cdnUrl")
+            if not rel:
+                raise ValueError("cdnUrl missing in upload response")
+        
+            full_url = encode_special_chars("%s%s" % (args.get_cdn.rstrip("/"), rel))
+            atomic_write(args.embedding_cdn, full_url)
+        
+            print("[INFO] Upload complete")
+            print("[CDN] URL: %s" % full_url)
+        
+        except Exception:
+            traceback.print_exc()
+            sys.exit(1)
+        finally:
+            for f in tmp_files:
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+    args:
+      - --embedding
+      - {inputPath: embedding}
+      - --bearer_token
+      - {inputValue: bearer_token}
+      - --domain
+      - {inputValue: domain}
+      - --get_cdn
+      - {inputValue: get_cdn}
+      - --embedding_cdn
+      - {outputPath: embedding_cdn}
