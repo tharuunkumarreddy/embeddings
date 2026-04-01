@@ -1,17 +1,18 @@
-name: Regime R2 - Measurement & Statistical
-description: BOCPD change-point flags fed into a VAE for statistical quality embedding. embed_dim=32. REGIME_DIMS: [32, 64].
+name: Regime R2 - Measurement & Statistical new
+description: 'BOCPD change-point flags fed into a VAE for statistical quality embedding. embed_dim=32. REGIME_DIMS [32, 64].'
+
 inputs:
   - name: regime_id
     type: String
     description: 'Regime identifier (r1..r9) used in metadata output'
     default: 'r2'
   - name: bundle
-    type: String
+    type: Object
     description: 'Path to bundle.pkl from Preprocessor component'
   - name: c_m_path
-    type: String
+    type: Object
     description: 'Path to c_m_bundle.parquet from C_m Loader (empty = no gating)'
-    default: ''
+    optional: true
   - name: countries
     type: String
     description: 'Comma-separated ISO3 country codes. Empty = auto-detect from bundle.'
@@ -27,10 +28,10 @@ inputs:
 
 outputs:
   - name: embeddings
-    type: Data
+    type: Object
     description: 'Regime embeddings Parquet (country | year | isic_code | isic_level | dim_0..dim_31)'
   - name: meta
-    type: Data
+    type: Object
     description: 'Regime metadata JSON (embed_dim, regime_dims, output_shape, runtime_s)'
 
 implementation:
@@ -50,7 +51,17 @@ implementation:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
         log = logging.getLogger("regime_r2")
 
-        # -- Inline BaseRegimeModel ----------------------------------------------------
+        def resolve_artifact_path(path: str) -> str:
+            if not path:
+                return path
+            if os.path.isdir(path):
+                for root, dirs, files in os.walk(path):
+                    for fname in sorted(files):
+                        resolved = os.path.join(root, fname)
+                        log.info(f"Resolved artifact dir -> file: {resolved}")
+                        return resolved
+                raise FileNotFoundError(f"No file found inside artifact directory: {path}")
+            return path
 
         class BaseRegimeModel(abc.ABC):
             @property
@@ -63,19 +74,15 @@ implementation:
             def fit(self, data_dict: dict) -> None: ...
             @abc.abstractmethod
             def embed(self, data_dict: dict) -> torch.Tensor: ...
-
             @staticmethod
             def to_tensor(arr):
                 return torch.from_numpy(np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)).float()
-
             @staticmethod
             def guard_output(t, name):
                 if torch.isnan(t).any() or torch.isinf(t).any():
                     log.warning(f"{name}: NaN/Inf in output - replacing with 0")
                     t = torch.nan_to_num(t, nan=0.0, posinf=1.0, neginf=0.0)
                 return t
-
-        # -- R2 Model: BOCPD + VAE -----------------------------------------------------
 
         EMBED_DIM  = 32
         HIDDEN_DIM = 64
@@ -84,7 +91,7 @@ implementation:
 
         SRC_KEYS    = ["WDI", "WEO", "OECD_GOV", "BIS_credit", "UNCTAD_PCI", "UNIDO_MVA"]
         SRC_DIMS    = {"WDI": 7, "WEO": 6, "OECD_GOV": 4, "BIS_credit": 4, "UNCTAD_PCI": 3, "UNIDO_MVA": 4}
-        TOTAL_INPUT = sum(SRC_DIMS.values())   # 28
+        TOTAL_INPUT = sum(SRC_DIMS.values())
 
         def bocpd_change_flag(series: np.ndarray, hazard: float = 0.1) -> np.ndarray:
             T = len(series)
@@ -128,36 +135,28 @@ implementation:
                     nn.Linear(latent, hidden), nn.GELU(),
                     nn.Linear(hidden, in_dim), nn.Sigmoid(),
                 )
-
             def encode(self, x):
                 h = self.encoder(x)
                 return self.fc_mu(h), self.fc_logvar(h)
-
             def reparameterise(self, mu, logvar):
                 if self.training:
                     return mu + torch.randn_like(mu) * (0.5 * logvar).exp()
                 return mu
-
             def forward(self, x):
                 mu, lv = self.encode(x)
                 z = self.reparameterise(mu, lv)
                 return z, mu, lv, self.decoder(z)
-
             def loss(self, x, recon, mu, logvar):
                 return (nn.functional.mse_loss(recon, x)
                         - 0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(-1).mean())
 
         class MeasurementRegime(BaseRegimeModel):
-            
-
             @property
             def regime_name(self): return "Measurement & Statistical"
             @property
             def embed_dim(self): return EMBED_DIM
-
             def __init__(self):
                 self.model = None
-
             def fit(self, data_dict):
                 cp = extract_bocpd_features(data_dict)
                 x  = torch.from_numpy(cp)
@@ -171,7 +170,6 @@ implementation:
                     nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     opt.step()
                 self.model.eval()
-
             def embed(self, data_dict):
                 if self.model is None:
                     self.fit(data_dict)
@@ -179,8 +177,6 @@ implementation:
                 with torch.no_grad():
                     _, mu, _, _ = self.model(torch.from_numpy(cp))
                 return self.guard_output(mu, self.regime_name)
-
-        # -- Runner utilities (inlined) ------------------------------------------------
 
         def get_country_ids_from_bundle(data_dict):
             if "__countries__" in data_dict:
@@ -202,13 +198,21 @@ implementation:
             result.insert(1, "isic_level", c_m_df["isic_level"].values if "isic_level" in c_m_df.columns else "")
             return result
 
-        def run_for_bundle(data_dict, model, c_m_df, countries, years):
-            all_rows = []
+        def run_for_bundle(data_dict, model, c_m_df, countries, years, output_path):
+            import pyarrow as pa
+            import pyarrow.parquet as pq
             N = len(countries)
+            embed_dim = model.embed_dim
             log.info(f"  Fitting model: {model.regime_name}")
             model.fit(data_dict)
             base_np = model.embed(data_dict).detach().numpy()
             log.info(f"  Base embedding: {base_np.shape}")
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            writer = None
+            total_rows = 0
+            chunk_buf = []
+            FLUSH_EVERY = 20
+            dim_cols = [f"dim_{i}" for i in range(embed_dim)]
             for ci, country in enumerate(countries):
                 emb_c = base_np[[ci]]
                 c_m_c = c_m_df[c_m_df["country"] == country] if "country" in c_m_df.columns else c_m_df
@@ -216,22 +220,38 @@ implementation:
                     c_m_yr = (c_m_c[c_m_c["year"] == year]
                               if "year" in c_m_df.columns and not c_m_c.empty else c_m_c)
                     if c_m_yr.empty:
-                        all_rows.append({"country": country, "year": year,
-                                         "isic_code": "ALL", "isic_level": "ALL",
-                                         **{f"dim_{i}": float(emb_c[0, i])
-                                            for i in range(emb_c.shape[1])}})
+                        row = {"country": country, "year": year,
+                               "isic_code": "ALL", "isic_level": "ALL"}
+                        for i in range(embed_dim):
+                            row[dim_cols[i]] = float(emb_c[0, i])
+                        chunk_buf.append(row)
                         continue
                     gdf = apply_cm_gating(emb_c, c_m_yr)
                     if gdf.empty:
                         continue
                     gdf.insert(0, "year", year)
                     gdf.insert(0, "country", country)
-                    all_rows.extend(gdf.to_dict("records"))
-                if (ci + 1) % 20 == 0:
-                    log.info(f"  {ci+1}/{N} countries ...")
-            return pd.DataFrame(all_rows)
-
-        # -- Main ---------------------------------------------------------------------
+                    chunk_buf.extend(gdf.to_dict("records"))
+                if (ci + 1) % FLUSH_EVERY == 0 and chunk_buf:
+                    chunk_df = pd.DataFrame(chunk_buf)
+                    table = pa.Table.from_pandas(chunk_df, preserve_index=False)
+                    if writer is None:
+                        writer = pq.ParquetWriter(output_path, table.schema, compression="snappy")
+                    writer.write_table(table)
+                    total_rows += len(chunk_df)
+                    log.info(f"  {ci+1}/{N} countries ... flushed {total_rows} rows")
+                    chunk_buf = []
+            if chunk_buf:
+                chunk_df = pd.DataFrame(chunk_buf)
+                table = pa.Table.from_pandas(chunk_df, preserve_index=False)
+                if writer is None:
+                    writer = pq.ParquetWriter(output_path, table.schema, compression="snappy")
+                writer.write_table(table)
+                total_rows += len(chunk_df)
+            if writer:
+                writer.close()
+            log.info(f"  Streaming complete: {total_rows} total rows")
+            return total_rows
 
         def main():
             ap = argparse.ArgumentParser(description="Component: Regime Runner")
@@ -244,41 +264,34 @@ implementation:
             ap.add_argument("--year_start", type=int, default=2010)
             ap.add_argument("--year_end",   type=int, default=2025)
             args = ap.parse_args()
-
             log.info("=" * 60)
             log.info(f"  Regime Runner  |  regime={args.regime_id}  (Measurement & Statistical)")
             log.info("=" * 60)
-
-            with open(args.bundle, "rb") as f:
+            bundle_path = resolve_artifact_path(args.bundle)
+            with open(bundle_path, "rb") as f:
                 data_dict = pickle.load(f)
-
             countries = ([c.strip() for c in args.countries.split(",")]
                          if args.countries else get_country_ids_from_bundle(data_dict))
             years = list(range(args.year_start, args.year_end + 1))
-
             c_m_df = pd.DataFrame()
-            if args.c_m_path and os.path.exists(args.c_m_path):
-                c_m_df = pd.read_parquet(args.c_m_path)
-                log.info(f"C_m loaded: {c_m_df.shape}")
-
+            if args.c_m_path:
+                cm_resolved = resolve_artifact_path(args.c_m_path)
+                if cm_resolved and os.path.exists(cm_resolved):
+                    c_m_df = pd.read_parquet(cm_resolved)
+                    log.info(f"C_m loaded: {c_m_df.shape}")
             model = MeasurementRegime()
             log.info(f"Running {model.regime_name}  embed_dim={model.embed_dim}  "
                      f"N={len(countries)}  T={len(years)}")
-
             t0 = time.time()
-            result_df = run_for_bundle(data_dict, model, c_m_df, countries, years)
+            total_rows = run_for_bundle(data_dict, model, c_m_df, countries, years, args.output)
             elapsed = time.time() - t0
-
-            os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-            result_df.to_parquet(args.output, index=False, engine="pyarrow", compression="snappy")
-            log.info(f"Saved -> {args.output}  shape={result_df.shape}  ({elapsed:.1f}s)")
-
+            log.info(f"Saved -> {args.output}  rows={total_rows}  ({elapsed:.1f}s)")
             if args.meta_path:
                 os.makedirs(os.path.dirname(args.meta_path) or ".", exist_ok=True)
                 with open(args.meta_path, "w") as f:
                     json.dump({"regime_id": args.regime_id, "regime_name": model.regime_name,
                                "embed_dim": model.embed_dim, "regime_dims": [32, 64],
-                               "output_shape": list(result_df.shape),
+                               "output_rows": total_rows,
                                "runtime_s": round(elapsed, 2)}, f, indent=2)
 
         if __name__ == "__main__":
@@ -287,9 +300,9 @@ implementation:
       - --regime_id
       - {inputValue: regime_id}
       - --bundle
-      - {inputValue: bundle}
+      - {inputPath: bundle}
       - --c_m_path
-      - {inputValue: c_m_path}
+      - {inputPath: c_m_path}
       - --countries
       - {inputValue: countries}
       - --year_start
