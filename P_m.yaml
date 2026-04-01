@@ -1,0 +1,234 @@
+name: P_m - Phase Mapper
+description: 'Derive phase-of-cycle embeddings (P_m) from regime r1, r3, r4 embeddings'
+
+inputs:
+  - name: r1_path
+    type: Object
+    description: 'Path to r1.parquet (Political Power embeddings)'
+    optional: true
+  - name: r3_path
+    type: Object
+    description: 'Path to r3.parquet (Economic Coordination embeddings)'
+    optional: true
+  - name: r4_path
+    type: Object
+    description: 'Path to r4.parquet (Regulatory & Enforcement embeddings)'
+    optional: true
+  - name: countries
+    type: String
+    description: 'Comma-separated ISO3 country codes'
+    default: ''
+  - name: year_start
+    type: String
+    description: 'Start year (inclusive)'
+    default: '2010'
+  - name: year_end
+    type: String
+    description: 'End year (inclusive)'
+    default: '2025'
+
+outputs:
+  - name: p_m_data
+    type: Object
+    description: 'Phase embeddings Parquet (country | year | phase_0..phase_5)'
+
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:v23
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import os, json, argparse, logging
+        import numpy as np
+        import pandas as pd
+        import torch
+
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+        log = logging.getLogger("p_m")
+
+        N_PHASES = 6
+        PHASE_NAMES = [
+            "Pre-formalization", "Formalizing", "Platformizing",
+            "Fragmenting", "Stagnant Equilibrium", "Institutional Collapse",
+        ]
+
+        def resolve_artifact_path(path: str) -> str:
+            if not path:
+                return path
+            if os.path.isdir(path):
+                for root, dirs, files in os.walk(path):
+                    for fname in sorted(files):
+                        resolved = os.path.join(root, fname)
+                        log.info(f"Resolved artifact dir -> file: {resolved}")
+                        return resolved
+                raise FileNotFoundError(f"No file found inside artifact directory: {path}")
+            return path
+
+        class GaussianHMM:
+            # Gaussian HMM with EM for phase detection
+            def __init__(self, n_states, obs_dim, n_iter=50):
+                self.K = n_states
+                self.D = obs_dim
+                self.n_iter = n_iter
+                rng = np.random.default_rng(42)
+                self.pi    = np.ones(self.K) / self.K
+                self.A     = rng.dirichlet(np.ones(self.K), size=self.K)
+                self.means = rng.standard_normal((self.K, self.D)) * 0.1
+                self.covs  = np.stack([np.eye(self.D) for _ in range(self.K)])
+                self._last_gamma = None
+            def _gaussian_pdf(self, x):
+                from scipy.stats import multivariate_normal
+                liks = np.zeros((self.K, len(x)))
+                for k in range(self.K):
+                    liks[k] = multivariate_normal.pdf(
+                        x, mean=self.means[k],
+                        cov=self.covs[k] + np.eye(self.D) * 1e-4,
+                        allow_singular=True,
+                    )
+                return liks + 1e-300
+            def fit(self, X):
+                N, D = X.shape
+                for _ in range(self.n_iter):
+                    B = self._gaussian_pdf(X)
+                    alpha = np.zeros((N, self.K))
+                    alpha[0] = self.pi * B[:, 0]
+                    alpha[0] /= alpha[0].sum() + 1e-300
+                    for t in range(1, N):
+                        alpha[t] = (alpha[t-1] @ self.A) * B[:, t]
+                        alpha[t] /= alpha[t].sum() + 1e-300
+                    beta = np.ones((N, self.K))
+                    for t in range(N-2, -1, -1):
+                        beta[t] = (self.A * B[:, t+1]).sum(axis=1)
+                        beta[t] /= beta[t].sum() + 1e-300
+                    gamma = alpha * beta
+                    gamma /= (gamma.sum(axis=1, keepdims=True) + 1e-300)
+                    Nk = gamma.sum(axis=0) + 1e-8
+                    self.means = (gamma.T @ X) / Nk[:, None]
+                    for k in range(self.K):
+                        diff = X - self.means[k]
+                        wdiff = gamma[:, k:k+1] * diff
+                        self.covs[k] = (wdiff.T @ diff) / Nk[k]
+                self._last_gamma = gamma
+            def predict_proba(self, X):
+                B     = self._gaussian_pdf(X)
+                gamma = (self.pi[:, None] * B).T
+                gamma /= gamma.sum(axis=1, keepdims=True) + 1e-300
+                return gamma.astype(np.float32)
+
+        class PhaseMembership:
+            # Compute 6-phase soft membership from r1+r3+r4 embeddings via HMM
+            def compute(self, r1, r3, r4):
+                # r1, r3, r4: (N, 32) tensors -> concatenate and reduce via PCA-like
+                combined = torch.cat([r1, r3, r4], dim=-1).numpy()  # (N, 96)
+                # Reduce to 8 dims via SVD for HMM stability
+                U, S, Vt = np.linalg.svd(combined - combined.mean(0), full_matrices=False)
+                reduced = (U[:, :8] * S[:8]).astype(np.float32)
+                hmm = GaussianHMM(N_PHASES, reduced.shape[1], n_iter=30)
+                hmm.fit(reduced)
+                proba = hmm.predict_proba(reduced)  # (N, 6)
+                return torch.from_numpy(proba)
+
+        def detect_countries_from_parquet(path):
+            df = pd.read_parquet(path)
+            if "country" in df.columns:
+                return sorted(df["country"].dropna().unique().tolist())
+            return []
+
+        def parquet_to_tensor(path, countries):
+            df = pd.read_parquet(path)
+            dim_cols = sorted([c for c in df.columns if c.startswith("dim_")])
+            if not dim_cols:
+                return torch.zeros(len(countries), 32)
+            # Average across years/sectors per country
+            if "country" in df.columns:
+                agg = df.groupby("country")[dim_cols].mean()
+                result = np.zeros((len(countries), len(dim_cols)), dtype=np.float32)
+                for ci, iso in enumerate(countries):
+                    if iso in agg.index:
+                        result[ci] = agg.loc[iso].values.astype(np.float32)
+                return torch.from_numpy(result)
+            return torch.from_numpy(df[dim_cols].values[:len(countries)].astype(np.float32))
+
+        def tensor_to_df(tensor, countries, col_prefix, years):
+            arr  = tensor.detach().numpy()
+            K    = arr.shape[1]
+            cols = [f"{col_prefix}_{i}" for i in range(K)]
+            rows = []
+            for ci, country in enumerate(countries):
+                for yr in years:
+                    row = {"country": country, "year": yr}
+                    row.update({cols[k]: float(arr[ci, k]) for k in range(K)})
+                    rows.append(row)
+            return pd.DataFrame(rows)
+
+        def main():
+            ap = argparse.ArgumentParser(description="Component: Supplementary P_m")
+            ap.add_argument("--r1_path",    default="")
+            ap.add_argument("--r3_path",    default="")
+            ap.add_argument("--r4_path",    default="")
+            ap.add_argument("--countries",  default="")
+            ap.add_argument("--year_start", type=int, default=2010)
+            ap.add_argument("--year_end",   type=int, default=2025)
+            ap.add_argument("--output",     required=True)
+            args = ap.parse_args()
+            log.info("=" * 60)
+            log.info("  Supplementary: P_m  (Structural Phase Membership)")
+            log.info("=" * 60)
+            years = list(range(args.year_start, args.year_end + 1))
+            # Resolve artifact paths
+            r1_p = resolve_artifact_path(args.r1_path) if args.r1_path else ""
+            r3_p = resolve_artifact_path(args.r3_path) if args.r3_path else ""
+            r4_p = resolve_artifact_path(args.r4_path) if args.r4_path else ""
+            if args.countries:
+                countries = [c.strip() for c in args.countries.split(",")]
+            else:
+                countries = []
+                for p in [r1_p, r3_p, r4_p]:
+                    if p and os.path.exists(p):
+                        countries = detect_countries_from_parquet(p)
+                        break
+            N = len(countries)
+            log.info(f"Countries ({N})  Years: {len(years)}")
+            have_inputs = all(p and os.path.exists(p) for p in [r1_p, r3_p, r4_p])
+            if have_inputs:
+                r1_emb = parquet_to_tensor(r1_p, countries)
+                r3_emb = parquet_to_tensor(r3_p, countries)
+                r4_emb = parquet_to_tensor(r4_p, countries)
+                log.info(f"R1: {tuple(r1_emb.shape)}  R3: {tuple(r3_emb.shape)}  R4: {tuple(r4_emb.shape)}")
+                pm = PhaseMembership()
+                p_m_tensor = pm.compute(r1_emb, r3_emb, r4_emb)
+                log.info(f"P_m tensor: {tuple(p_m_tensor.shape)}")
+            else:
+                log.warning("R1/R3/R4 parquets missing - P_m defaults to uniform 1/6")
+                p_m_tensor = torch.full((max(N, 1), 6), 1.0 / 6.0)
+            p_m_df = tensor_to_df(p_m_tensor, countries, col_prefix="phase", years=years)
+            os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+            p_m_df.to_parquet(args.output, index=False, engine="pyarrow", compression="snappy")
+            log.info(f"P_m saved -> {args.output}  shape={p_m_df.shape}")
+            phase_cols = [f"phase_{i}" for i in range(6)]
+            sample = p_m_df.drop_duplicates("country").head(5)
+            for _, row in sample.iterrows():
+                probs   = [row[c] for c in phase_cols]
+                dom_idx = int(np.argmax(probs))
+                log.info(f"  {row['country']}: dominant phase = {PHASE_NAMES[dom_idx]} ({probs[dom_idx]:.3f})")
+            log.info("  P_m DONE")
+
+        if __name__ == "__main__":
+            main()
+    args:
+      - --r1_path
+      - {inputPath: r1_path}
+      - --r3_path
+      - {inputPath: r3_path}
+      - --r4_path
+      - {inputPath: r4_path}
+      - --countries
+      - {inputValue: countries}
+      - --year_start
+      - {inputValue: year_start}
+      - --year_end
+      - {inputValue: year_end}
+      - --output
+      - {outputPath: p_m_data}
