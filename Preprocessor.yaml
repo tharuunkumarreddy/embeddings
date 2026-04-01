@@ -127,12 +127,14 @@ implementation:
         def project_to_market(df, markets, iso3_col, year_col=None):
             if iso3_col not in df.columns:
                 return pd.DataFrame(index=range(len(markets)))
+            df = df.copy()
+            df[iso3_col] = df[iso3_col].astype(str)
             latest = (
                 df.sort_values(year_col).groupby(iso3_col).last().reset_index()
                 if year_col and year_col in df.columns
                 else df.groupby(iso3_col).last().reset_index()
             )
-            ref = pd.DataFrame({iso3_col: markets})
+            ref = pd.DataFrame({iso3_col: [str(m) for m in markets]})
             return ref.merge(latest, on=iso3_col, how="left")
         
         def build_ts(df, value_col, year_col, markets, iso3_col, T_STEPS):
@@ -392,8 +394,8 @@ implementation:
             N = len(markets)
             market_idx = {m: i for i, m in enumerate(markets)}
         
-            reporter_col = next((c for c in ["reporter_iso3", "reporteriso3", "reporter_code", "iso3", "country_code", "reporter"] if c in df.columns), None)
-            partner_col  = next((c for c in ["partner_iso3", "partneriso3", "partner_code", "partner"] if c in df.columns), None)
+            reporter_col = next((c for c in ["reporter_iso3", "reporteriso3", "iso3", "country_code", "reporter", "reporter_code"] if c in df.columns), None)
+            partner_col  = next((c for c in ["partner_iso3", "partneriso3", "partner", "partner_code"] if c in df.columns), None)
             val_col      = next((c for c in ["trade_value", "tradevalue", "primaryvalue", "value_usd"] if c in df.columns), None)
         
             adj = np.zeros((N, N), dtype=np.float32)
