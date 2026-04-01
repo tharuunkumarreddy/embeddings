@@ -1,17 +1,18 @@
-name: Regime R9 - Temporal & Shock
-description: BOCPD change-point features + linear SSM (Kalman). embed_dim=32. REGIME_DIMS: [256, 288].
+name: Regime R9 - Temporal & Shock new
+description: 'BOCPD change-point features + linear SSM (Kalman). embed_dim=32. REGIME_DIMS [256, 288].'
+
 inputs:
   - name: regime_id
     type: String
     description: 'Regime identifier (r1..r9) used in metadata output'
     default: 'r9'
   - name: bundle
-    type: String
+    type: Object
     description: 'Path to bundle.pkl from Preprocessor component'
   - name: c_m_path
-    type: String
+    type: Object
     description: 'Path to c_m_bundle.parquet from C_m Loader (empty = no gating)'
-    default: ''
+    optional: true
   - name: countries
     type: String
     description: 'Comma-separated ISO3 country codes. Empty = auto-detect from bundle.'
@@ -27,10 +28,10 @@ inputs:
 
 outputs:
   - name: embeddings
-    type: Data
+    type: Object
     description: 'Regime embeddings Parquet (country | year | isic_code | isic_level | dim_0..dim_31)'
   - name: meta
-    type: Data
+    type: Object
     description: 'Regime metadata JSON'
 
 implementation:
@@ -50,7 +51,17 @@ implementation:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
         log = logging.getLogger("regime_r9")
 
-        # -- Inline BaseRegimeModel ----------------------------------------------------
+        def resolve_artifact_path(path: str) -> str:
+            if not path:
+                return path
+            if os.path.isdir(path):
+                for root, dirs, files in os.walk(path):
+                    for fname in sorted(files):
+                        resolved = os.path.join(root, fname)
+                        log.info(f"Resolved artifact dir -> file: {resolved}")
+                        return resolved
+                raise FileNotFoundError(f"No file found inside artifact directory: {path}")
+            return path
 
         class BaseRegimeModel(abc.ABC):
             @property
@@ -63,11 +74,9 @@ implementation:
             def fit(self, data_dict: dict) -> None: ...
             @abc.abstractmethod
             def embed(self, data_dict: dict) -> torch.Tensor: ...
-
             @staticmethod
             def to_tensor(arr):
                 return torch.from_numpy(np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)).float()
-
             @staticmethod
             def guard_output(t, name):
                 if torch.isnan(t).any() or torch.isinf(t).any():
@@ -75,20 +84,67 @@ implementation:
                     t = torch.nan_to_num(t, nan=0.0, posinf=1.0, neginf=0.0)
                 return t
 
-        # -- R9 Model: BOCPD + SSM (inlined - no import from r2) ----------------------
-
-        EMBED_DIM  = 32
-        HIDDEN_DIM = 48
-        N_EPOCHS   = 150
-        LR         = 1e-3
-
+        EMBED_DIM      = 32
+        HIDDEN_DIM     = 48
+        N_EPOCHS       = 150
+        LR             = 1e-3
         SSM_LATENT     = 8
-        OBS_DIM        = 2   # GDELT (1) + BIS (1)
-        SHOCK_FEAT_DIM = 3 + 3 + 4   # GDELT BOCPD(3) + BIS BOCPD(3) + GFSR(4) = 10
+        OBS_DIM        = 2
+        SHOCK_FEAT_DIM = 10   # GDELT_spikes BOCPD(3) + BIS_credit BOCPD(3) + IMF_GFSR(4)
 
         def bocpd_change_flag(series: np.ndarray, hazard: float = 0.1) -> np.ndarray:
-    BOCPD on GDELT + BIS time series + IMF_GFSR -> (N, 10).
+            T = len(series)
+            if T < 3:
+                return np.zeros(T, dtype=np.float32)
+            R = np.zeros((T + 1, T + 1))
+            R[0, 0] = 1.0
+            mu0, kappa, alpha, beta = 0.0, 1.0, 1.0, 1.0
+            for t in range(1, T + 1):
+                x = series[t - 1]
+                nu    = 2 * alpha
+                sigma = np.sqrt(beta * (kappa + 1) / (kappa * alpha))
+                from scipy.stats import t as student_t
+                pp = np.exp(np.clip(student_t.logpdf(x, df=nu, loc=mu0, scale=sigma + 1e-8), -50, 50))
+                R[t, 1:t + 1] = R[t - 1, :t] * pp * (1 - hazard)
+                R[t, 0]       = np.sum(R[t - 1, :t]) * hazard
+                R[t]         /= (np.sum(R[t]) + 1e-12)
+            return np.clip([R[tt, 0] for tt in range(1, T + 1)], 0.0, 1.0).astype(np.float32)
 
+        def bocpd_summary(ts_2d: np.ndarray) -> np.ndarray:
+            # ts_2d: (N, T) -> returns (N, 3): [max_cp, mean_cp, last_cp]
+            N, T = ts_2d.shape
+            out = np.zeros((N, 3), dtype=np.float32)
+            for i in range(N):
+                flags = bocpd_change_flag(ts_2d[i].astype(np.float64))
+                out[i, 0] = flags.max()
+                out[i, 1] = flags.mean()
+                out[i, 2] = flags[-1] if len(flags) > 0 else 0.0
+            return out
+
+        def extract_shock_features(data_dict: dict) -> np.ndarray:
+            gdelt_cp = bocpd_summary(data_dict["GDELT_spikes_ts"])   # (N, 3)
+            bis_cp   = bocpd_summary(data_dict["BIS_credit_ts"])     # (N, 3)
+            gfsr     = np.nan_to_num(data_dict["IMF_GFSR"], nan=0.0).astype(np.float32)  # (N, 4)
+            return np.concatenate([gdelt_cp, bis_cp, gfsr], axis=1).astype(np.float32)   # (N, 10)
+
+        class LinearSSM(nn.Module):
+            # Simple linear state-space model: z_{t+1} = A z_t + B u_t; x_t = C z_t
+            def __init__(self, obs_dim, latent_dim):
+                super().__init__()
+                self.A = nn.Parameter(torch.eye(latent_dim) * 0.9 + torch.randn(latent_dim, latent_dim) * 0.01)
+                self.B = nn.Parameter(torch.randn(latent_dim, obs_dim) * 0.01)
+                self.C = nn.Parameter(torch.randn(obs_dim, latent_dim) * 0.01)
+                self.z0 = nn.Parameter(torch.zeros(latent_dim))
+            def forward(self, x):
+                # x: (N, T, obs_dim) -> z_final: (N, latent), x_hat: (N, obs_dim)
+                N, T, _ = x.shape
+                z = self.z0.unsqueeze(0).expand(N, -1)
+                for t in range(T):
+                    z = z @ self.A.T + x[:, t, :] @ self.B.T
+                x_hat = z @ self.C.T
+                return z, x_hat
+
+        class ShockHead(nn.Module):
             def __init__(self, ssm_dim, feat_dim, embed_dim, hidden):
                 super().__init__()
                 self.net = nn.Sequential(
@@ -96,22 +152,17 @@ implementation:
                     nn.LayerNorm(hidden), nn.GELU(),
                     nn.Linear(hidden, embed_dim),
                 )
-
             def forward(self, z_ssm, cp_feats):
                 return self.net(torch.cat([z_ssm, cp_feats], dim=-1))
 
         class TemporalShockRegime(BaseRegimeModel):
-            
-
             @property
             def regime_name(self): return "Temporal & Shock"
             @property
             def embed_dim(self): return EMBED_DIM
-
             def __init__(self):
                 self.ssm  = None
                 self.head = None
-
             def _get_ts(self, data_dict):
                 g = torch.from_numpy(
                     np.nan_to_num(data_dict["GDELT_spikes_ts"], nan=0.0).astype(np.float32)
@@ -119,18 +170,15 @@ implementation:
                 b = torch.from_numpy(
                     np.nan_to_num(data_dict["BIS_credit_ts"], nan=0.0).astype(np.float32)
                 ).unsqueeze(-1)
-                return torch.cat([g, b], dim=-1)   # (N, T, 2)
-
+                return torch.cat([g, b], dim=-1)
             def fit(self, data_dict):
                 ts_x = self._get_ts(data_dict)
                 cp   = torch.from_numpy(extract_shock_features(data_dict))
                 ts_mean = ts_x.mean(dim=1)
-
                 self.ssm  = LinearSSM(OBS_DIM, SSM_LATENT)
                 self.head = ShockHead(SSM_LATENT, SHOCK_FEAT_DIM, EMBED_DIM, HIDDEN_DIM)
                 params = list(self.ssm.parameters()) + list(self.head.parameters())
                 opt = torch.optim.Adam(params, lr=LR)
-
                 for _ in range(N_EPOCHS):
                     opt.zero_grad()
                     z_ssm, x_hat = self.ssm(ts_x)
@@ -141,10 +189,8 @@ implementation:
                     (recon_loss + div).backward()
                     nn.utils.clip_grad_norm_(params, 1.0)
                     opt.step()
-
                 self.ssm.eval()
                 self.head.eval()
-
             def embed(self, data_dict):
                 if self.ssm is None:
                     self.fit(data_dict)
@@ -154,8 +200,6 @@ implementation:
                     z_ssm, _ = self.ssm(ts_x)
                     emb = self.head(z_ssm, cp)
                 return self.guard_output(emb, self.regime_name)
-
-        # -- Runner utilities (inlined) ------------------------------------------------
 
         def get_country_ids_from_bundle(data_dict):
             if "__countries__" in data_dict:
@@ -177,13 +221,21 @@ implementation:
             result.insert(1, "isic_level", c_m_df["isic_level"].values if "isic_level" in c_m_df.columns else "")
             return result
 
-        def run_for_bundle(data_dict, model, c_m_df, countries, years):
-            all_rows = []
+        def run_for_bundle(data_dict, model, c_m_df, countries, years, output_path):
+            import pyarrow as pa
+            import pyarrow.parquet as pq
             N = len(countries)
+            embed_dim = model.embed_dim
             log.info(f"  Fitting model: {model.regime_name}")
             model.fit(data_dict)
             base_np = model.embed(data_dict).detach().numpy()
             log.info(f"  Base embedding: {base_np.shape}")
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            writer = None
+            total_rows = 0
+            chunk_buf = []
+            FLUSH_EVERY = 20
+            dim_cols = [f"dim_{i}" for i in range(embed_dim)]
             for ci, country in enumerate(countries):
                 emb_c = base_np[[ci]]
                 c_m_c = c_m_df[c_m_df["country"] == country] if "country" in c_m_df.columns else c_m_df
@@ -191,26 +243,41 @@ implementation:
                     c_m_yr = (c_m_c[c_m_c["year"] == year]
                               if "year" in c_m_df.columns and not c_m_c.empty else c_m_c)
                     if c_m_yr.empty:
-                        all_rows.append({"country": country, "year": year,
-                                         "isic_code": "ALL", "isic_level": "ALL",
-                                         **{f"dim_{i}": float(emb_c[0, i])
-                                            for i in range(emb_c.shape[1])}})
+                        row = {"country": country, "year": year, "isic_code": "ALL", "isic_level": "ALL"}
+                        for i in range(embed_dim):
+                            row[dim_cols[i]] = float(emb_c[0, i])
+                        chunk_buf.append(row)
                         continue
                     gdf = apply_cm_gating(emb_c, c_m_yr)
                     if gdf.empty:
                         continue
                     gdf.insert(0, "year", year)
                     gdf.insert(0, "country", country)
-                    all_rows.extend(gdf.to_dict("records"))
-                if (ci + 1) % 20 == 0:
-                    log.info(f"  {ci+1}/{N} countries ...")
-            return pd.DataFrame(all_rows)
-
-        # -- Main ---------------------------------------------------------------------
+                    chunk_buf.extend(gdf.to_dict("records"))
+                if (ci + 1) % FLUSH_EVERY == 0 and chunk_buf:
+                    chunk_df = pd.DataFrame(chunk_buf)
+                    table = pa.Table.from_pandas(chunk_df, preserve_index=False)
+                    if writer is None:
+                        writer = pq.ParquetWriter(output_path, table.schema, compression="snappy")
+                    writer.write_table(table)
+                    total_rows += len(chunk_df)
+                    log.info(f"  {ci+1}/{N} countries ... flushed {total_rows} rows")
+                    chunk_buf = []
+            if chunk_buf:
+                chunk_df = pd.DataFrame(chunk_buf)
+                table = pa.Table.from_pandas(chunk_df, preserve_index=False)
+                if writer is None:
+                    writer = pq.ParquetWriter(output_path, table.schema, compression="snappy")
+                writer.write_table(table)
+                total_rows += len(chunk_df)
+            if writer:
+                writer.close()
+            log.info(f"  Streaming complete: {total_rows} total rows")
+            return total_rows
 
         def main():
             ap = argparse.ArgumentParser(description="Component: Regime Runner")
-            ap.add_argument("--regime_id",  default="r9", help="Regime identifier")
+            ap.add_argument("--regime_id",  default="r9")
             ap.add_argument("--bundle",     required=True)
             ap.add_argument("--c_m_path",   default="")
             ap.add_argument("--output",     required=True)
@@ -219,41 +286,34 @@ implementation:
             ap.add_argument("--year_start", type=int, default=2010)
             ap.add_argument("--year_end",   type=int, default=2025)
             args = ap.parse_args()
-
             log.info("=" * 60)
             log.info(f"  Regime Runner  |  regime={args.regime_id}  (Temporal & Shock)")
             log.info("=" * 60)
-
-            with open(args.bundle, "rb") as f:
+            bundle_path = resolve_artifact_path(args.bundle)
+            with open(bundle_path, "rb") as f:
                 data_dict = pickle.load(f)
-
             countries = ([c.strip() for c in args.countries.split(",")]
                          if args.countries else get_country_ids_from_bundle(data_dict))
             years = list(range(args.year_start, args.year_end + 1))
-
             c_m_df = pd.DataFrame()
-            if args.c_m_path and os.path.exists(args.c_m_path):
-                c_m_df = pd.read_parquet(args.c_m_path)
-                log.info(f"C_m loaded: {c_m_df.shape}")
-
+            if args.c_m_path:
+                cm_resolved = resolve_artifact_path(args.c_m_path)
+                if cm_resolved and os.path.exists(cm_resolved):
+                    c_m_df = pd.read_parquet(cm_resolved)
+                    log.info(f"C_m loaded: {c_m_df.shape}")
             model = TemporalShockRegime()
             log.info(f"Running {model.regime_name}  embed_dim={model.embed_dim}  "
                      f"N={len(countries)}  T={len(years)}")
-
             t0 = time.time()
-            result_df = run_for_bundle(data_dict, model, c_m_df, countries, years)
+            total_rows = run_for_bundle(data_dict, model, c_m_df, countries, years, args.output)
             elapsed = time.time() - t0
-
-            os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-            result_df.to_parquet(args.output, index=False, engine="pyarrow", compression="snappy")
-            log.info(f"Saved -> {args.output}  shape={result_df.shape}  ({elapsed:.1f}s)")
-
+            log.info(f"Saved -> {args.output}  rows={total_rows}  ({elapsed:.1f}s)")
             if args.meta_path:
                 os.makedirs(os.path.dirname(args.meta_path) or ".", exist_ok=True)
                 with open(args.meta_path, "w") as f:
                     json.dump({"regime_id": args.regime_id, "regime_name": model.regime_name,
                                "embed_dim": model.embed_dim, "regime_dims": [256, 288],
-                               "output_shape": list(result_df.shape),
+                               "output_rows": total_rows,
                                "runtime_s": round(elapsed, 2)}, f, indent=2)
 
         if __name__ == "__main__":
@@ -262,9 +322,9 @@ implementation:
       - --regime_id
       - {inputValue: regime_id}
       - --bundle
-      - {inputValue: bundle}
+      - {inputPath: bundle}
       - --c_m_path
-      - {inputValue: c_m_path}
+      - {inputPath: c_m_path}
       - --countries
       - {inputValue: countries}
       - --year_start
