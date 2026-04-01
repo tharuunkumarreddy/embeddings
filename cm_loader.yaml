@@ -1,29 +1,13 @@
-name: C_m Loader - Country-Market Crosswalk
+name: C_m_Loader_V3
 description: Load ISIC sector crosswalk CSV to produce c_m_bundle.parquet containing sector weights, gates, and ISIC codes per country/year for regime gating.
 inputs:
-  - name: isic_csv
-    type: Data
-    description: 'Path to playbook_a_isic_full_v2.csv (ISIC crosswalk)'
-  - name: countries
-    type: String
-    description: 'Comma-separated ISO3 country codes. Empty = all.'
-    default: ''
-  - name: year_start
-    type: String
-    description: 'Start year (inclusive)'
-  - name: year_end
-    type: String
-    description: 'End year (inclusive)'
-  - name: isic_level
-    type: String
-    description: 'ISIC aggregation level filter (empty = all levels)'
-    default: ''
-
+  - {name: isic_csv, type: Object, optional: false}
+  - {name: countries, type: String, optional: false}
+  - {name: year_start, type: String, optional: false}
+  - {name: year_end, type: String, optional: false}
+  - {name: isic_level, type: String, optional: false}
 outputs:
-  - name: c_m_bundle
-    type: Data
-    description: 'Country-market crosswalk Parquet (country | year | isic_code | isic_level | sector_weight | c_m_gate)'
-
+  - {name: c_m_bundle, type: Object}
 implementation:
   container:
     image: nikhilv215/nesy-factory:v23
@@ -35,12 +19,12 @@ implementation:
         import os
         import argparse
         import logging
-
+        
         import pandas as pd
-
+        
         logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
         log = logging.getLogger("cm_loader")
-
+        
         # C_m column names as in the ISIC CSV
         CM_COLS = [
             "c_m_observability", "c_m_incentive_to_report", "c_m_temporal_lag",
@@ -54,19 +38,17 @@ implementation:
             "isic_section", "isic_division", "isic_group", "isic_class",
             "aggregate_activity", "dominant_isic_section", "dominant_sector_share_pct",
         ]
-
+        
         def resolve_artifact_path(path: str) -> str:
-            #KFP/Argo mounts inputPath artifacts as a directory.
-            #If the given path is a directory, walk it and return the first file found.
             if os.path.isdir(path):
                 for root, dirs, files in os.walk(path):
-                    for fname in sorted(files):  # sorted for determinism
+                    for fname in sorted(files):
                         resolved = os.path.join(root, fname)
                         log.info(f"Resolved artifact dir -> file: {resolved}")
                         return resolved
                 raise FileNotFoundError(f"No file found inside artifact directory: {path}")
-            return path  # already a plain file path
-
+            return path
+        
         def load_c_m(
             isic_csv: str,
             countries: list,
@@ -74,50 +56,43 @@ implementation:
             year_end: int,
             isic_level: str = "",
         ) -> pd.DataFrame:
-            # Resolve directory-mounted artifact to actual file
             isic_csv = resolve_artifact_path(isic_csv)
-
+        
             log.info(f"Reading ISIC CSV: {isic_csv}")
             df = pd.read_csv(isic_csv, low_memory=False)
             log.info(f"Total rows: {len(df):,}")
-
-            # Year filter
+        
             if "year" in df.columns:
                 df = df[(df["year"] >= year_start) & (df["year"] <= year_end)]
             log.info(f"After year filter ({year_start}-{year_end}): {len(df):,}")
-
-            # Country filter -- skip if countries list is empty (load all)
+        
             country_col = next((c for c in ["country", "iso3", "iso_code"] if c in df.columns), None)
             if country_col and countries:
                 df = df[df[country_col].isin(countries)]
                 log.info(f"After country filter ({len(countries)} countries): {len(df):,}")
             else:
                 log.info(f"No country filter applied -- keeping all countries: {len(df):,}")
-
-            # ISIC level filter -- skip if isic_level is empty
+        
             if isic_level and "isic_level" in df.columns:
                 df = df[df["isic_level"] == isic_level]
                 log.info(f"After isic_level filter ('{isic_level}'): {len(df):,}")
-
-            # Keep only useful columns
+        
             meta_present = [c for c in META_COLS if c in df.columns]
             cm_present   = [c for c in CM_COLS   if c in df.columns]
             df = df[meta_present + cm_present].copy()
-
-            # Compute aggregate C_m gate (mean of all c_m_* columns)
+        
             if cm_present:
                 df["c_m_gate"] = df[cm_present].mean(axis=1).clip(0, 1)
             else:
                 df["c_m_gate"] = 0.5
-
-            # sector_weight from dominant_sector_share_pct
+        
             if "dominant_sector_share_pct" in df.columns:
                 df["sector_weight"] = (df["dominant_sector_share_pct"] / 100.0).clip(0, 1)
             else:
                 df["sector_weight"] = 1.0
-
+        
             return df.reset_index(drop=True)
-
+        
         def main():
             ap = argparse.ArgumentParser(description="Component: C_m constraint loader")
             ap.add_argument("--isic_csv",    required=True,  help="Path to playbook_a_isic_full_v2.csv")
@@ -129,13 +104,13 @@ implementation:
             ap.add_argument("--isic_level",  default="",
                             help="Optional ISIC level filter: Section, Division, Group, Class")
             args = ap.parse_args()
-
+        
             countries = [c.strip() for c in args.countries.split(",")] if args.countries.strip() else []
-
+        
             log.info("=" * 60)
             log.info("  C_m Constraint Loader")
             log.info("=" * 60)
-
+        
             df = load_c_m(
                 args.isic_csv,
                 countries,
@@ -143,15 +118,15 @@ implementation:
                 args.year_end,
                 isic_level=args.isic_level,
             )
-
+        
             os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
             df.to_parquet(args.output_path, index=False, engine="pyarrow", compression="snappy")
-
+        
             log.info(f"Saved C_m bundle -> {args.output_path}  shape={df.shape}")
             log.info(f"  Countries : {df['country'].nunique() if 'country' in df.columns else 'N/A'}")
             log.info(f"  C_m gate mean: {df['c_m_gate'].mean():.4f}  min: {df['c_m_gate'].min():.4f}")
             log.info("=" * 60)
-
+        
         if __name__ == "__main__":
             main()
     args:
