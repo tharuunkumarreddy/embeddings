@@ -1,4 +1,4 @@
-name: Regime R1 - Political Power
+name: Regime R1 - Political Power_new
 description: Multi-View VAE across 5 political sources (WGI, IMF_ArtIV, GDELT_govt, OECD_GOV, WITS_policy). embed_dim=32. REGIME_DIMS: [0, 32].
   
 inputs:
@@ -7,12 +7,12 @@ inputs:
     description: 'Regime identifier (r1..r9) used in metadata output'
     default: 'r1'
   - name: bundle
-    type: String
+    type: Object
     description: 'Path to bundle.pkl from Preprocessor component'
   - name: c_m_path
-    type: String
+    type: Object
     description: 'Path to c_m_bundle.parquet from C_m Loader (empty = no gating)'
-    default: ''
+    optional: true
   - name: countries
     type: String
     description: 'Comma-separated ISO3 country codes. Empty = auto-detect from bundle.'
@@ -28,10 +28,10 @@ inputs:
 
 outputs:
   - name: embeddings
-    type: Data
+    type: Object
     description: 'Regime embeddings Parquet (country | year | isic_code | isic_level | dim_0..dim_31)'
   - name: meta
-    type: Data
+    type: Object
     description: 'Regime metadata JSON (embed_dim, regime_dims, output_shape, runtime_s)'
 
 implementation:
@@ -51,6 +51,20 @@ implementation:
 
         logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
         log = logging.getLogger("regime_r1")
+
+        # -- Artifact path resolver (same as Preprocessor) -----------------------------
+
+        def resolve_artifact_path(path: str) -> str:
+            if not path:
+                return path
+            if os.path.isdir(path):
+                for root, dirs, files in os.walk(path):
+                    for fname in sorted(files):
+                        resolved = os.path.join(root, fname)
+                        log.info(f"Resolved artifact dir -> file: {resolved}")
+                        return resolved
+                raise FileNotFoundError(f"No file found inside artifact directory: {path}")
+            return path
 
         # -- Inline BaseRegimeModel ----------------------------------------------------
 
@@ -266,7 +280,9 @@ implementation:
             log.info(f"  Regime Runner  |  regime={args.regime_id}  (Political Power)")
             log.info("=" * 60)
 
-            with open(args.bundle, "rb") as f:
+            # Resolve artifact directory paths to actual files
+            bundle_path = resolve_artifact_path(args.bundle)
+            with open(bundle_path, "rb") as f:
                 data_dict = pickle.load(f)
 
             countries = ([c.strip() for c in args.countries.split(",")]
@@ -274,9 +290,11 @@ implementation:
             years = list(range(args.year_start, args.year_end + 1))
 
             c_m_df = pd.DataFrame()
-            if args.c_m_path and os.path.exists(args.c_m_path):
-                c_m_df = pd.read_parquet(args.c_m_path)
-                log.info(f"C_m loaded: {c_m_df.shape}")
+            if args.c_m_path:
+                cm_resolved = resolve_artifact_path(args.c_m_path)
+                if cm_resolved and os.path.exists(cm_resolved):
+                    c_m_df = pd.read_parquet(cm_resolved)
+                    log.info(f"C_m loaded: {c_m_df.shape}")
 
             model = PoliticalPowerRegime()
             log.info(f"Running {model.regime_name}  embed_dim={model.embed_dim}  "
@@ -304,9 +322,9 @@ implementation:
       - --regime_id
       - {inputValue: regime_id}
       - --bundle
-      - {inputValue: bundle}
+      - {inputPath: bundle}
       - --c_m_path
-      - {inputValue: c_m_path}
+      - {inputPath: c_m_path}
       - --countries
       - {inputValue: countries}
       - --year_start
